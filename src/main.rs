@@ -12,14 +12,13 @@ use gitlab::{MergeRequest, Project, Role};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::mpsc,
-    thread,
 };
 
 /// Pick a GitLab merge request you review and open it in Zed in review order.
 ///
-/// Arrow keys move, Enter checks the branch out and opens Zed, `o` opens the
-/// merge request in the browser, `r` refreshes, `q` quits. Stacked merge
+/// Arrow keys move, Enter checks the branch out and opens Zed while the list
+/// stays open, `g` opens the merge request in GitLab, `r` refreshes the list
+/// from GitLab, `u` and `d` scroll the description, `q` quits. Stacked merge
 /// requests sit under the one they are stacked on and are diffed against that
 /// branch rather than the default branch.
 #[derive(Parser)]
@@ -33,7 +32,7 @@ struct Args {
     #[arg(long, env = "ZED_APP")]
     zed_app: Option<PathBuf>,
 
-    /// Repositories to list merge requests from. Defaults to $ZED_REVIEW_REPOS
+    /// Repositories to list merge requests from. Defaults to $CHANGEWALK_REPOS
     /// (colon separated), else the current directory.
     repos: Vec<PathBuf>,
 }
@@ -54,38 +53,35 @@ fn main() -> Result<()> {
         .map(|project| (project.repo.clone(), project.default_branch.clone()))
         .collect();
 
-    // Show the last list straight away and refresh it in the background, so
-    // the picker is usable before GitLab answers.
+    // The last list shows straight away from the cache; `r` asks GitLab for
+    // a fresh one.
     let cached: Vec<MergeRequest> = projects
         .iter()
         .flat_map(gitlab::cached_merge_requests)
         .collect();
-    let (sender, receiver) = mpsc::channel();
-    for project in projects.clone() {
-        let sender = sender.clone();
-        thread::spawn(move || {
-            let result = gitlab::fetch_merge_requests(&project, role);
-            sender.send((project, result)).ok();
-        });
-    }
-    drop(sender);
-
     let title = projects
         .iter()
         .map(|project| project.path.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let picked = picker::run(cached, receiver, projects.len(), default_branches, title)?;
-    if let Some(merge_request) = picked {
-        launch::open_in_zed(&merge_request, args.zed_app)?;
-    }
-    Ok(())
+    let zed_app = args.zed_app;
+    picker::run(
+        cached,
+        projects,
+        role,
+        default_branches,
+        title,
+        move |merge_request| launch::open_in_zed(merge_request, zed_app.clone()),
+    )
 }
 
 fn repositories(args: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let repos = if !args.is_empty() {
         args
-    } else if let Some(configured) = std::env::var_os("ZED_REVIEW_REPOS") {
+    } else if let Some(configured) = std::env::var_os("CHANGEWALK_REPOS")
+        .or_else(|| std::env::var_os("DIFFWALK_REPOS"))
+        .or_else(|| std::env::var_os("ZED_REVIEW_REPOS"))
+    {
         configured
             .to_string_lossy()
             .split(':')

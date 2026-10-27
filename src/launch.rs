@@ -8,14 +8,16 @@ use std::{
 };
 
 /// Checks the branch out, hands the merge request to Zed as a file, and opens
-/// the diff with a suggested review order.
-pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Result<()> {
+/// the diff with a suggested review order. Returns a line saying what
+/// happened, for the picker's status, since it runs while the picker owns
+/// the terminal.
+pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Result<String> {
     let zed_app = zed_app.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_default()
             .join("Applications/Zed Dev.app")
     });
-    check_out(merge_request)?;
+    let warning = check_out(merge_request)?;
     let file = write_merge_request_file(merge_request)?;
 
     let mut query = vec![("repo", merge_request.repo.to_string_lossy().into_owned())];
@@ -54,16 +56,21 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Re
     if !status.success() {
         bail!("could not open {}", zed_app.display());
     }
-    println!(
-        "Opened !{} ({}) in Zed with a suggested review order.",
+    let mut message = format!(
+        "opened !{} ({}) in Zed",
         merge_request.iid, merge_request.source_branch
     );
-    Ok(())
+    if let Some(warning) = warning {
+        message.push_str(" · ");
+        message.push_str(&warning);
+    }
+    Ok(message)
 }
 
 /// Fetches the branch, and its base for a stacked merge request, in one round
-/// trip, then checks it out or fast-forwards it if it is already local.
-fn check_out(merge_request: &MergeRequest) -> Result<()> {
+/// trip, then checks it out or fast-forwards it if it is already local. A
+/// local branch that cannot fast-forward is kept as it is, with a warning.
+fn check_out(merge_request: &MergeRequest) -> Result<Option<String>> {
     let repo = &merge_request.repo;
     if !git(repo, &["status", "--porcelain"])?.is_empty() {
         bail!(
@@ -79,7 +86,11 @@ fn check_out(merge_request: &MergeRequest) -> Result<()> {
     git(repo, &fetch)?;
 
     let remote = format!("origin/{source}");
-    let local_exists = git(repo, &["show-ref", "--verify", &format!("refs/heads/{source}")]).is_ok();
+    let local_exists = git(
+        repo,
+        &["show-ref", "--verify", &format!("refs/heads/{source}")],
+    )
+    .is_ok();
     let current = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if !local_exists {
         git(repo, &["checkout", "--track", "-b", source, &remote])?;
@@ -87,17 +98,19 @@ fn check_out(merge_request: &MergeRequest) -> Result<()> {
         if current != source {
             git(repo, &["checkout", source])?;
         }
-        if let Err(error) = git(repo, &["merge", "--ff-only", &remote]) {
-            eprintln!("{source} is not up to date with {remote}: {error}");
+        if git(repo, &["merge", "--ff-only", &remote]).is_err() {
+            return Ok(Some(format!(
+                "{source} is behind {remote} and did not fast-forward"
+            )));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Writes the merge request as JSON for Zed to show above the diff, which
 /// saves Zed two round trips to GitLab.
 fn write_merge_request_file(merge_request: &MergeRequest) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("zed-review");
+    let dir = std::env::temp_dir().join("changewalk");
     std::fs::create_dir_all(&dir).context("creating the temporary directory")?;
     let file = dir.join(format!("{}.json", merge_request.iid));
     std::fs::write(&file, serde_json::to_string(merge_request)?)

@@ -55,15 +55,24 @@ pub struct MergeRequest {
     /// parent merge request is in the list.
     #[serde(skip)]
     pub stacked: bool,
+    /// Who has approved, by name. The list reply does not carry this; it
+    /// comes from a second request per merge request.
+    #[serde(default)]
+    pub approved_by: Vec<String>,
+    #[serde(default)]
+    pub user_has_approved: bool,
+    /// Lines added and removed, from a second request per project.
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
 }
 
 impl MergeRequest {
     pub fn author_name(&self) -> &str {
-        self.author.as_ref().map_or("", |author| author.name.as_str())
-    }
-
-    pub fn updated_day(&self) -> &str {
-        self.updated_at.get(..10).unwrap_or(&self.updated_at)
+        self.author
+            .as_ref()
+            .map_or("", |author| author.name.as_str())
     }
 }
 
@@ -73,10 +82,13 @@ impl Project {
             .with_context(|| format!("{} has no origin remote", repo.display()))?;
         let (host, path) = parse_remote(&url)
             .with_context(|| format!("{url} does not look like a GitLab remote"))?;
-        let default_branch = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-            .ok()
-            .and_then(|name| name.strip_prefix("origin/").map(str::to_string))
-            .unwrap_or_else(|| "main".to_string());
+        let default_branch = git(
+            repo,
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .ok()
+        .and_then(|name| name.strip_prefix("origin/").map(str::to_string))
+        .unwrap_or_else(|| "main".to_string());
         Ok(Self {
             repo: repo.to_path_buf(),
             host,
@@ -130,9 +142,40 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("zed-review");
+    let dir = dirs::cache_dir()?.join("changewalk");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// The merge request most recently opened in Zed from the picker, kept
+/// between runs so the list can point it out.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LastOpened {
+    pub web_url: String,
+    /// RFC 3339, local time.
+    pub at: String,
+}
+
+fn last_opened_file() -> Option<PathBuf> {
+    Some(cache_dir()?.join("last_opened.json"))
+}
+
+pub fn last_opened() -> Option<LastOpened> {
+    let text = std::fs::read_to_string(last_opened_file()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn remember_opened(merge_request: &MergeRequest) -> LastOpened {
+    let opened = LastOpened {
+        web_url: merge_request.web_url.clone(),
+        at: chrono::Local::now().to_rfc3339(),
+    };
+    if let Some(file) = last_opened_file()
+        && let Ok(text) = serde_json::to_string(&opened)
+    {
+        std::fs::write(file, text).ok();
+    }
+    opened
 }
 
 /// The token glab logged in with, or `GITLAB_TOKEN`.
@@ -141,7 +184,7 @@ fn token(host: &str) -> Result<String> {
         return Ok(token.to_string_lossy().into_owned());
     }
     let output = Command::new("glab")
-        .args(["config", "get", "token", "-h", host])
+        .args(["config", "get", "token", "--host", host])
         .output()
         .context("running glab; install it and run `glab auth login`")?;
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -218,6 +261,36 @@ pub fn fetch_merge_requests(project: &Project, role: Role) -> Result<Vec<MergeRe
     for merge_request in &mut merge_requests {
         merge_request.repo = project.repo.clone();
     }
+    // Approvals take one request each, so fetch them side by side. A
+    // failure leaves that merge request showing no approvals.
+    let iids: Vec<u64> = merge_requests.iter().map(|mr| mr.iid).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = merge_requests
+            .iter()
+            .map(|merge_request| {
+                let token = token.as_str();
+                let endpoint =
+                    project.api(&format!("merge_requests/{}/approvals", merge_request.iid));
+                scope.spawn(move || fetch_approvals(&endpoint, token))
+            })
+            .collect();
+        // Line counts come from one GraphQL query for the whole list.
+        let diff_stats = scope.spawn(|| fetch_diff_stats(project, &token, &iids));
+        for (merge_request, handle) in merge_requests.iter_mut().zip(handles) {
+            if let Ok(Ok(approvals)) = handle.join() {
+                merge_request.approved_by = approvals.approved_by;
+                merge_request.user_has_approved = approvals.user_has_approved;
+            }
+        }
+        if let Ok(Ok(diff_stats)) = diff_stats.join() {
+            for merge_request in &mut merge_requests {
+                if let Some((additions, deletions)) = diff_stats.get(&merge_request.iid) {
+                    merge_request.additions = *additions;
+                    merge_request.deletions = *deletions;
+                }
+            }
+        }
+    });
     if let Some(file) = project.cache_file() {
         let cache = Cache {
             fetched_at: now_seconds(),
@@ -232,6 +305,107 @@ pub fn fetch_merge_requests(project: &Project, role: Role) -> Result<Vec<MergeRe
 struct Cache {
     fetched_at: u64,
     merge_requests: Vec<MergeRequest>,
+}
+
+struct Approvals {
+    approved_by: Vec<String>,
+    user_has_approved: bool,
+}
+
+/// Lines added and removed by each merge request, by iid.
+fn fetch_diff_stats(
+    project: &Project,
+    token: &str,
+    iids: &[u64],
+) -> Result<HashMap<u64, (u64, u64)>> {
+    #[derive(Deserialize)]
+    struct Reply {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        project: Option<ProjectNode>,
+    }
+    #[derive(Deserialize)]
+    struct ProjectNode {
+        #[serde(rename = "mergeRequests")]
+        merge_requests: Nodes,
+    }
+    #[derive(Deserialize)]
+    struct Nodes {
+        nodes: Vec<Node>,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        iid: String,
+        #[serde(rename = "diffStatsSummary")]
+        diff_stats_summary: Option<Summary>,
+    }
+    #[derive(Deserialize)]
+    struct Summary {
+        additions: u64,
+        deletions: u64,
+    }
+    if iids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let iids: Vec<String> = iids.iter().map(|iid| format!("\"{iid}\"")).collect();
+    let query = format!(
+        "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid diffStatsSummary {{ additions deletions }} }} }} }} }}",
+        project.path,
+        iids.join(",")
+    );
+    let reply: Reply = agent()
+        .post(&format!("https://{}/api/graphql", project.host))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(serde_json::json!({ "query": query }))
+        .map_err(|error| anyhow!("fetching diff stats: {error}"))?
+        .into_json()
+        .context("the diff stats reply is not the expected JSON")?;
+    Ok(reply
+        .data
+        .and_then(|data| data.project)
+        .map(|project| project.merge_requests.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|node| {
+            let summary = node.diff_stats_summary?;
+            Some((
+                node.iid.parse().ok()?,
+                (summary.additions, summary.deletions),
+            ))
+        })
+        .collect())
+}
+
+fn fetch_approvals(endpoint: &str, token: &str) -> Result<Approvals> {
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(default)]
+        approved_by: Vec<Approver>,
+        #[serde(default)]
+        user_has_approved: bool,
+    }
+    #[derive(Deserialize)]
+    struct Approver {
+        #[serde(default)]
+        user: Option<Author>,
+    }
+    let reply: Reply = agent()
+        .get(endpoint)
+        .set("PRIVATE-TOKEN", token)
+        .call()
+        .map_err(|error| anyhow!("fetching approvals: {error}"))?
+        .into_json()
+        .context("the approvals reply is not the expected JSON")?;
+    Ok(Approvals {
+        approved_by: reply
+            .approved_by
+            .into_iter()
+            .filter_map(|approver| approver.user.map(|user| user.name))
+            .collect(),
+        user_has_approved: reply.user_has_approved,
+    })
 }
 
 fn now_seconds() -> u64 {
@@ -284,7 +458,10 @@ pub fn order_as_stacks(
     let mut roots = Vec::new();
     for (index, merge_request) in merge_requests.iter().enumerate() {
         let parent = index_by_source
-            .get(&(merge_request.repo.clone(), merge_request.target_branch.clone()))
+            .get(&(
+                merge_request.repo.clone(),
+                merge_request.target_branch.clone(),
+            ))
             .copied()
             .filter(|&parent| parent != index);
         match parent {
@@ -293,7 +470,11 @@ pub fn order_as_stacks(
         }
     }
     let newest_first = |indices: &mut Vec<usize>| {
-        indices.sort_by(|&a, &b| merge_requests[b].updated_at.cmp(&merge_requests[a].updated_at))
+        indices.sort_by(|&a, &b| {
+            merge_requests[b]
+                .updated_at
+                .cmp(&merge_requests[a].updated_at)
+        })
     };
     newest_first(&mut roots);
     for indices in children.values_mut() {
@@ -354,6 +535,10 @@ mod tests {
             repo: PathBuf::from("/r"),
             depth: 0,
             stacked: false,
+            approved_by: Vec::new(),
+            user_has_approved: false,
+            additions: 0,
+            deletions: 0,
         }
     }
 

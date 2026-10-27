@@ -1,18 +1,24 @@
-# zed-review
+# changewalk
 
-Pick an open GitLab merge request you review, and open its diff in Zed with a
-model-suggested reading order, guiding notes, and the merge request description
-above the files.
+Walk a GitLab merge request in Zed. Pick one you review, and its diff opens
+with a model-suggested reading order, guiding notes, the merge request
+description above the files, and the review threads under their lines.
 
 ```
-zed-review ~/Repos/my-project
+changewalk ~/Repos/my-project
 ```
 
-Arrow keys move, Enter checks the branch out and opens Zed, `o` opens the merge
-request in the browser, `q` quits. Stacked merge requests sit under the one they
-are stacked on and are diffed against that branch, not the default branch.
+Arrow keys move, Enter checks the branch out and opens Zed while the list stays
+open, `g` opens the merge request in GitLab, `r` refreshes the list from GitLab,
+`u` and `d` scroll the description, `q` quits. The merge request most
+recently opened in Zed is marked with `●`, and the footer says when. The
+Approved column shows `✓ you`, `✓ you +1`, or `✓ 2`, and the description pane
+names the approvers. The Diff column shows lines added and removed. Stacked
+merge requests sit under the one they are stacked on and are diffed against
+that branch, not the default branch.
 
-The last list shows at once from a cache and refreshes in the background.
+The last list shows at once from a cache and only changes when you press `r`,
+except on a first run with nothing cached, when it fetches straight away.
 
 ## Requirements
 
@@ -26,10 +32,10 @@ The last list shows at once from a cache and refreshes in the background.
 
 ```
 cargo build --release
-ln -s "$PWD/target/release/zed-review" ~/.local/bin/zed-review
+ln -s "$PWD/target/release/changewalk" ~/.local/bin/changewalk
 ```
 
-Set `ZED_REVIEW_REPOS` to a colon-separated list of repositories to list from
+Set `CHANGEWALK_REPOS` to a colon-separated list of repositories to list from
 any directory. Pass `--assignee` to list merge requests assigned to you instead
 of ones you review.
 
