@@ -22,13 +22,29 @@ use std::{
     time::Duration,
 };
 
-type FetchResult = (Project, Result<Vec<MergeRequest>>);
+/// One step of a refresh, each carrying the project's whole list with more
+/// of it filled in, so the screen can show what is known so far.
+enum FetchStage {
+    /// Titles, authors, and bases; cached details carried over where the
+    /// merge request has not changed.
+    Listed(Vec<MergeRequest>),
+    /// Approvals and comment and line counts from GitLab.
+    Detailed(Vec<MergeRequest>),
+    /// Line counts retaken from the clone after a fetch.
+    Counted(Vec<MergeRequest>),
+    /// A line for the footer, from warming Zed's order cache.
+    Status(String),
+    Done,
+}
+
+type FetchResult = (Project, Result<FetchStage>);
 
 /// Opens a merge request in Zed and says what happened, or why not.
 type Launcher = dyn Fn(&MergeRequest) -> Result<String> + Send + Sync;
 
 const NUMBER: Color = Color::Cyan;
 const AUTHOR: Color = Color::Magenta;
+const DRAFT: Color = Color::DarkGray;
 const STACKED: Color = Color::Yellow;
 const DIM: Color = Color::DarkGray;
 const HEADING: Color = Color::Green;
@@ -157,6 +173,7 @@ impl Picker {
     /// stays live, and remembers it as the last one opened.
     fn launch(&mut self, launcher: &Arc<Launcher>) {
         if self.launching.is_some() {
+            self.status = "still opening the last one; a fetch may be waiting on git".into();
             return;
         }
         let Some(merge_request) = self.items.get(self.selected).cloned() else {
@@ -173,7 +190,9 @@ impl Picker {
     }
 
     /// Asks GitLab for every project's list on its own thread, unless a
-    /// refresh is already running.
+    /// refresh is already running, and brings the clone's remote branches
+    /// up to date at the same time, so the diffs Zed draws are against
+    /// current bases.
     fn refresh(&mut self) {
         if self.pending_fetches > 0 {
             return;
@@ -182,9 +201,66 @@ impl Picker {
         for project in self.projects.clone() {
             let sender = sender.clone();
             let role = self.role;
+            let cached: Vec<MergeRequest> = self
+                .items
+                .iter()
+                .filter(|mr| mr.repo == project.repo)
+                .cloned()
+                .collect();
             thread::spawn(move || {
-                let result = gitlab::fetch_merge_requests(&project, role);
-                sender.send((project, result)).ok();
+                let send = |stage: Result<FetchStage>| sender.send((project.clone(), stage)).ok();
+                let mut list = match gitlab::fetch_lists(&project, role, &cached) {
+                    Ok(list) => list,
+                    Err(error) => {
+                        send(Err(error));
+                        send(Ok(FetchStage::Done));
+                        return;
+                    }
+                };
+                send(Ok(FetchStage::Listed(list.clone())));
+                if let Err(error) = gitlab::fill_details(&project, &mut list) {
+                    send(Err(error));
+                }
+                send(Ok(FetchStage::Detailed(list.clone())));
+                // A fetch from a moment ago, as a launch does, is good enough.
+                if !gitlab::git_fetched_recently(&project) {
+                    match gitlab::git(&project.repo, &["fetch", "--prune", "origin"]) {
+                        Ok(_) => gitlab::mark_git_fetched(&project),
+                        Err(error) => {
+                            send(Err(error));
+                        }
+                    }
+                }
+                // GitLab's counts are from the merge base, which shows a
+                // squash-merged parent's work again; count the diff Zed will
+                // show, but only where the branch has moved since last time.
+                for merge_request in &mut list {
+                    let tip = gitlab::git(
+                        &project.repo,
+                        &[
+                            "rev-parse",
+                            &format!("origin/{}", merge_request.source_branch),
+                        ],
+                    )
+                    .ok();
+                    if tip.is_some() && tip == merge_request.counted_sha {
+                        continue;
+                    }
+                    if let Some((added, removed)) = crate::launch::local_diff_size(merge_request) {
+                        merge_request.additions = added;
+                        merge_request.deletions = removed;
+                        merge_request.counted_sha = tip;
+                    }
+                }
+                gitlab::write_cache(&project, &list);
+                send(Ok(FetchStage::Counted(list.clone())));
+                send(Ok(FetchStage::Done));
+                // Last, and after the list is reported done: the model is
+                // asked for the reading order of the top few, so Zed can
+                // show it at once when one is opened.
+                for line in crate::warm::warm_order_cache(&project, &list, 3) {
+                    send(Ok(FetchStage::Status(line)));
+                }
             });
         }
         self.pending_fetches = self.projects.len();
@@ -196,15 +272,29 @@ impl Picker {
         let Some(receiver) = &self.launching else {
             return;
         };
-        match receiver.try_recv() {
-            Ok(Ok(message)) => self.status = message,
-            Ok(Err(error)) => self.status = format!("could not open: {error:#}"),
+        let opened = match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                self.status = message;
+                true
+            }
+            Ok(Err(error)) => {
+                self.status = format!("could not open: {error:#}");
+                false
+            }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
-                self.status = "could not open: launch stopped".into()
+                self.status = "could not open: launch stopped".into();
+                false
             }
-        }
+        };
         self.launching = None;
+        // The launch fetched the clone, so the list's counts and bases can
+        // be brought in line with what Zed is now showing.
+        if opened {
+            let message = self.status.clone();
+            self.refresh();
+            self.status = format!("{message} · refreshing…");
+        }
     }
 
     fn is_last_opened(&self, merge_request: &MergeRequest) -> bool {
@@ -228,7 +318,26 @@ impl Picker {
         };
         loop {
             match receiver.try_recv() {
-                Ok((project, Ok(fresh))) => {
+                Ok((project, Ok(stage))) => {
+                    let fresh = match stage {
+                        FetchStage::Listed(list)
+                        | FetchStage::Detailed(list)
+                        | FetchStage::Counted(list) => list,
+                        FetchStage::Status(line) => {
+                            self.status = line;
+                            continue;
+                        }
+                        FetchStage::Done => {
+                            self.pending_fetches = self.pending_fetches.saturating_sub(1);
+                            if self.pending_fetches == 0 && !self.status.starts_with("could not") {
+                                self.status = format!(
+                                    "refreshed {}",
+                                    local_time(&chrono::Local::now().to_rfc3339())
+                                );
+                            }
+                            continue;
+                        }
+                    };
                     let selected_iid = self.items.get(self.selected).map(|mr| mr.iid);
                     let mut items: Vec<MergeRequest> = self
                         .items
@@ -240,19 +349,10 @@ impl Picker {
                     self.selected = selected_iid
                         .and_then(|iid| self.items.iter().position(|mr| mr.iid == iid))
                         .unwrap_or(0);
-                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
-                    self.status = if self.pending_fetches > 0 {
-                        "refreshing…".into()
-                    } else {
-                        format!(
-                            "refreshed {}",
-                            local_time(&chrono::Local::now().to_rfc3339())
-                        )
-                    };
+                    self.status = "refreshing…".into();
                 }
                 Ok((_, Err(error))) => {
-                    self.pending_fetches = self.pending_fetches.saturating_sub(1);
-                    self.status = format!("{error:#}");
+                    self.status = format!("could not refresh: {error:#}");
                 }
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
@@ -316,8 +416,18 @@ impl Picker {
                     Style::default().fg(OPENED),
                 ),
             ]);
-            let title = styled_title(&mr.title);
-            let author = Span::styled(mr.author_name().to_string(), Style::default().fg(AUTHOR));
+            let mut title = styled_title(&mr.title);
+            if mr.draft && !mr.title.to_ascii_lowercase().starts_with("draft") {
+                title.spans.insert(
+                    0,
+                    Span::styled("Draft · ", Style::default().fg(DRAFT).italic()),
+                );
+            }
+            let author = if mr.mine {
+                Span::styled("you", Style::default().fg(NUMBER))
+            } else {
+                Span::styled(mr.author_name().to_string(), Style::default().fg(AUTHOR))
+            };
             let target = if mr.stacked {
                 match parent_by_source.get(&(&mr.repo, mr.target_branch.as_str())) {
                     Some(parent) => {
@@ -333,6 +443,7 @@ impl Picker {
             };
             let updated = Span::styled(local_time(&mr.updated_at), Style::default().fg(DIM));
             let approved = Span::styled(approval_summary(mr), Style::default().fg(APPROVED));
+            let comments = comment_summary(mr);
             let size = Line::from(vec![
                 Span::styled(format!("+{}", mr.additions), Style::default().fg(ADDED)),
                 Span::raw(" "),
@@ -344,6 +455,7 @@ impl Picker {
                 Cell::from(author),
                 Cell::from(target),
                 Cell::from(size),
+                Cell::from(comments),
                 Cell::from(approved),
                 Cell::from(updated),
             ]);
@@ -360,11 +472,14 @@ impl Picker {
             Constraint::Length(20),
             Constraint::Fill(1),
             Constraint::Length(12),
+            Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(12),
         ];
-        let header = Row::new(["", "Title", "Author", "Base", "Diff", "Approved", "Updated"])
-            .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
+        let header = Row::new([
+            "", "Title", "Author", "Base", "Diff", "Comments", "Approved", "Updated",
+        ])
+        .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
         let table = Table::new(rows, widths)
             .header(header)
             .column_spacing(2)
@@ -460,6 +575,25 @@ impl Picker {
             area,
         );
     }
+}
+
+/// `12`, with `· 3 you` when some of the comments are the user's own;
+/// nothing when there are none.
+fn comment_summary(merge_request: &MergeRequest) -> Line<'static> {
+    if merge_request.comment_count == 0 {
+        return Line::from("");
+    }
+    let mut spans = vec![Span::styled(
+        merge_request.comment_count.to_string(),
+        Style::default().fg(DIM),
+    )];
+    if merge_request.my_comment_count > 0 {
+        spans.push(Span::styled(
+            format!(" · {} you", merge_request.my_comment_count),
+            Style::default().fg(NUMBER),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// `✓ you`, `✓ you +2`, or `✓ 3`, for the approved column; nothing when no
@@ -679,6 +813,7 @@ mod tests {
             ),
             author: Some(crate::gitlab::Author {
                 name: "Tim Barnes".into(),
+                username: "tim".into(),
             }),
             source_branch: source.into(),
             target_branch: target.into(),
@@ -695,6 +830,13 @@ mod tests {
             user_has_approved: depth == 0,
             additions: 193,
             deletions: 6,
+            comment_count: 11,
+            my_comment_count: if depth == 0 { 3 } else { 0 },
+            diff_refs: None,
+            draft: depth == 1,
+            mine: depth == 1,
+            counted_sha: None,
+            details_current: false,
         };
         let picker = Picker {
             items: vec![
@@ -729,11 +871,11 @@ mod tests {
             }),
             launching: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(110, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
         terminal.draw(|frame| picker.draw(frame)).unwrap();
         let frame: Vec<String> = (0..20)
             .map(|y| {
-                (0..110)
+                (0..130)
                     .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
                     .collect::<String>()
                     .trim_end()
@@ -749,6 +891,9 @@ mod tests {
         assert!(text.contains("● !1628 opened 19 Oct"));
         assert!(text.contains("✓ you +1"));
         assert!(text.contains("+193 −6"));
+        assert!(text.contains("11 · 3 you"));
+        assert!(text.contains("Draft · feat(kernel"));
+        assert!(text.contains("Draft · feat(kernel): a ci  you"));
         assert!(text.contains("✓ Approved by Tim Barnes, Jack Walters"));
         assert!(text.contains("↑ !1628"));
         assert!(text.contains("19 Oct 1"));

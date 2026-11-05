@@ -5,6 +5,7 @@
 mod gitlab;
 mod launch;
 mod picker;
+mod warm;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -31,6 +32,14 @@ struct Args {
     /// The Zed app bundle to open. Defaults to ~/Applications/Zed Dev.app.
     #[arg(long, env = "ZED_APP")]
     zed_app: Option<PathBuf>,
+
+    /// Open this merge request in Zed straight away, without the list.
+    #[arg(long, value_name = "IID")]
+    open: Option<u64>,
+
+    /// Write the Zed reading order for this merge request and exit.
+    #[arg(long, value_name = "IID")]
+    warm: Option<u64>,
 
     /// Repositories to list merge requests from. Defaults to $CHANGEWALK_REPOS
     /// (colon separated), else the current directory.
@@ -65,6 +74,40 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let zed_app = args.zed_app;
+    if let Some(iid) = args.warm {
+        let (project, merge_request) = projects
+            .iter()
+            .find_map(|project| {
+                gitlab::fetch_merge_request(project, iid)
+                    .ok()
+                    .map(|mr| (project, mr))
+            })
+            .with_context(|| format!("no merge request !{iid} in the listed projects"))?;
+        let written = warm::warm_by_iid(project, &merge_request)?;
+        println!(
+            "{}",
+            if written {
+                "wrote the order"
+            } else {
+                "an order was already cached, or the branch is not fetched"
+            }
+        );
+        return Ok(());
+    }
+    if let Some(iid) = args.open {
+        let merge_request = cached
+            .iter()
+            .find(|mr| mr.iid == iid)
+            .cloned()
+            .or_else(|| {
+                projects
+                    .iter()
+                    .find_map(|project| gitlab::fetch_merge_request(project, iid).ok())
+            })
+            .with_context(|| format!("no merge request !{iid} in the listed projects"))?;
+        println!("{}", launch::open_in_zed(&merge_request, zed_app)?);
+        return Ok(());
+    }
     picker::run(
         cached,
         projects,

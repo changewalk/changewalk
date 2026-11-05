@@ -26,9 +26,19 @@ pub enum Role {
     Assignee,
 }
 
+/// The commits GitLab's own diff of the merge request is between.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DiffRefs {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub start_sha: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Author {
     pub name: String,
+    #[serde(default)]
+    pub username: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,6 +76,28 @@ pub struct MergeRequest {
     pub additions: u64,
     #[serde(default)]
     pub deletions: u64,
+    /// Comments on the merge request, system notes left out, and how many
+    /// of them are the user's.
+    #[serde(default)]
+    pub comment_count: u64,
+    #[serde(default)]
+    pub my_comment_count: u64,
+    /// Only the single merge request reply carries this; the list does not.
+    #[serde(default)]
+    pub diff_refs: Option<DiffRefs>,
+    #[serde(default)]
+    pub draft: bool,
+    /// The user opened this merge request themselves.
+    #[serde(default)]
+    pub mine: bool,
+    /// The tip of the branch when the local line counts were taken, so
+    /// they are only retaken when it moves.
+    #[serde(default)]
+    pub counted_sha: Option<String>,
+    /// The approvals and counts came from the cache and need no request,
+    /// because the merge request has not been updated since.
+    #[serde(skip)]
+    pub details_current: bool,
 }
 
 impl MergeRequest {
@@ -194,11 +226,18 @@ fn token(host: &str) -> Result<String> {
     Ok(token)
 }
 
+/// One agent for the whole run, so connections and their TLS handshakes
+/// are reused between requests.
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(60))
-        .build()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(20))
+                .timeout(Duration::from_secs(60))
+                .build()
+        })
+        .clone()
 }
 
 #[derive(Deserialize, Serialize)]
@@ -238,67 +277,147 @@ fn username(host: &str, token: &str) -> Result<String> {
     Ok(user.username)
 }
 
-/// The open merge requests the user reviews or is assigned, newest first,
-/// and writes them to the cache.
-pub fn fetch_merge_requests(project: &Project, role: Role) -> Result<Vec<MergeRequest>> {
+/// One merge request as GitLab has it now, with its diff refs. Used at
+/// launch so a retargeted or rebased merge request is diffed against the
+/// right base, whatever the cached list said.
+pub fn fetch_merge_request(project: &Project, iid: u64) -> Result<MergeRequest> {
+    let token = token(&project.host)?;
+    let mut merge_request: MergeRequest = agent()
+        .get(&project.api(&format!("merge_requests/{iid}")))
+        .set("PRIVATE-TOKEN", &token)
+        .call()
+        .map_err(|error| anyhow!("fetching !{iid} from {}: {error}", project.path))?
+        .into_json()
+        .context("the merge request reply is not the expected JSON")?;
+    merge_request.repo = project.repo.clone();
+    merge_request.stacked = merge_request.target_branch != project.default_branch;
+    Ok(merge_request)
+}
+
+/// The open merge requests the user reviews or is assigned, and the ones
+/// they opened themselves, drafts included, newest first. Approvals and
+/// counts are carried over from `cached` for any merge request GitLab has
+/// not updated since, so the second stage can skip it.
+pub fn fetch_lists(
+    project: &Project,
+    role: Role,
+    cached: &[MergeRequest],
+) -> Result<Vec<MergeRequest>> {
     let token = token(&project.host)?;
     let username = username(&project.host, &token)?;
     let filter = match role {
         Role::Reviewer => "reviewer_username",
         Role::Assignee => "assignee_username",
     };
-    let mut merge_requests: Vec<MergeRequest> = agent()
-        .get(&project.api("merge_requests"))
-        .query("state", "opened")
-        .query("scope", "all")
-        .query("per_page", "100")
-        .query(filter, &username)
-        .set("PRIVATE-TOKEN", &token)
-        .call()
-        .map_err(|error| anyhow!("listing merge requests for {}: {error}", project.path))?
-        .into_json()
-        .context("the merge request list is not the expected JSON")?;
+    let list = |filter: &str| -> Result<Vec<MergeRequest>> {
+        agent()
+            .get(&project.api("merge_requests"))
+            .query("state", "opened")
+            .query("scope", "all")
+            .query("per_page", "100")
+            .query(filter, &username)
+            .set("PRIVATE-TOKEN", &token)
+            .call()
+            .map_err(|error| anyhow!("listing merge requests for {}: {error}", project.path))?
+            .into_json()
+            .context("the merge request list is not the expected JSON")
+    };
+    let mut merge_requests = list(filter)?;
+    for own in list("author_username")? {
+        if !merge_requests.iter().any(|mr| mr.iid == own.iid) {
+            merge_requests.push(own);
+        }
+    }
+    merge_requests.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     for merge_request in &mut merge_requests {
         merge_request.repo = project.repo.clone();
-    }
-    // Approvals take one request each, so fetch them side by side. A
-    // failure leaves that merge request showing no approvals.
-    let iids: Vec<u64> = merge_requests.iter().map(|mr| mr.iid).collect();
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = merge_requests
-            .iter()
-            .map(|merge_request| {
-                let token = token.as_str();
-                let endpoint =
-                    project.api(&format!("merge_requests/{}/approvals", merge_request.iid));
-                scope.spawn(move || fetch_approvals(&endpoint, token))
-            })
-            .collect();
-        // Line counts come from one GraphQL query for the whole list.
-        let diff_stats = scope.spawn(|| fetch_diff_stats(project, &token, &iids));
-        for (merge_request, handle) in merge_requests.iter_mut().zip(handles) {
-            if let Ok(Ok(approvals)) = handle.join() {
-                merge_request.approved_by = approvals.approved_by;
-                merge_request.user_has_approved = approvals.user_has_approved;
-            }
+        merge_request.mine = merge_request
+            .author
+            .as_ref()
+            .is_some_and(|author| author.username == username);
+        if let Some(known) = cached.iter().find(|known| {
+            known.iid == merge_request.iid && known.updated_at == merge_request.updated_at
+        }) {
+            merge_request.approved_by = known.approved_by.clone();
+            merge_request.user_has_approved = known.user_has_approved;
+            merge_request.additions = known.additions;
+            merge_request.deletions = known.deletions;
+            merge_request.comment_count = known.comment_count;
+            merge_request.my_comment_count = known.my_comment_count;
+            merge_request.counted_sha = known.counted_sha.clone();
+            merge_request.details_current = true;
         }
-        if let Ok(Ok(diff_stats)) = diff_stats.join() {
-            for merge_request in &mut merge_requests {
-                if let Some((additions, deletions)) = diff_stats.get(&merge_request.iid) {
-                    merge_request.additions = *additions;
-                    merge_request.deletions = *deletions;
-                }
-            }
-        }
-    });
-    if let Some(file) = project.cache_file() {
-        let cache = Cache {
-            fetched_at: now_seconds(),
-            merge_requests: merge_requests.clone(),
-        };
-        std::fs::write(file, serde_json::to_string(&cache)?).ok();
     }
     Ok(merge_requests)
+}
+
+/// Fills in approvals, line counts, and comment counts for the merge
+/// requests that still need them, in one GraphQL query.
+pub fn fill_details(project: &Project, merge_requests: &mut [MergeRequest]) -> Result<()> {
+    let iids: Vec<u64> = merge_requests
+        .iter()
+        .filter(|mr| !mr.details_current)
+        .map(|mr| mr.iid)
+        .collect();
+    if iids.is_empty() {
+        return Ok(());
+    }
+    let token = token(&project.host)?;
+    let username = username(&project.host, &token)?;
+    let details = fetch_details(project, &token, &username, &iids)?;
+    for merge_request in merge_requests.iter_mut() {
+        if let Some(details) = details.get(&merge_request.iid) {
+            merge_request.additions = details.additions;
+            merge_request.deletions = details.deletions;
+            merge_request.comment_count = details.comment_count;
+            merge_request.my_comment_count = details.my_comment_count;
+            merge_request.approved_by = details.approved_by.clone();
+            merge_request.user_has_approved = details.user_has_approved;
+            merge_request.counted_sha = None;
+        }
+    }
+    Ok(())
+}
+
+/// How long a `git fetch` is trusted before a refresh runs another.
+const GIT_FETCH_FRESH_FOR: Duration = Duration::from_secs(120);
+
+fn git_fetch_file(project: &Project) -> Option<PathBuf> {
+    let name = format!(
+        "fetched-{}__{}",
+        project.host,
+        project.path.replace('/', "__")
+    );
+    Some(cache_dir()?.join(name))
+}
+
+/// Notes that the project's clone was just fetched.
+pub fn mark_git_fetched(project: &Project) {
+    if let Some(file) = git_fetch_file(project) {
+        std::fs::write(file, now_seconds().to_string()).ok();
+    }
+}
+
+/// Whether the clone was fetched recently enough to leave alone.
+pub fn git_fetched_recently(project: &Project) -> bool {
+    git_fetch_file(project)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .is_some_and(|at| now_seconds().saturating_sub(at) < GIT_FETCH_FRESH_FOR.as_secs())
+}
+
+/// Remembers `merge_requests` as the project's list for the next start.
+pub fn write_cache(project: &Project, merge_requests: &[MergeRequest]) {
+    let Some(file) = project.cache_file() else {
+        return;
+    };
+    let cache = Cache {
+        fetched_at: now_seconds(),
+        merge_requests: merge_requests.to_vec(),
+    };
+    if let Ok(text) = serde_json::to_string(&cache) {
+        std::fs::write(file, text).ok();
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -307,17 +426,25 @@ struct Cache {
     merge_requests: Vec<MergeRequest>,
 }
 
-struct Approvals {
+/// What one GraphQL query tells about a merge request beyond the list.
+struct Details {
+    additions: u64,
+    deletions: u64,
+    comment_count: u64,
+    my_comment_count: u64,
     approved_by: Vec<String>,
     user_has_approved: bool,
 }
 
-/// Lines added and removed by each merge request, by iid.
-fn fetch_diff_stats(
+/// Line counts and comment counts for every listed merge request, in one
+/// GraphQL query per project. The user's own comments are counted among
+/// the first hundred notes, which covers all but the longest threads.
+fn fetch_details(
     project: &Project,
     token: &str,
+    username: &str,
     iids: &[u64],
-) -> Result<HashMap<u64, (u64, u64)>> {
+) -> Result<HashMap<u64, Details>> {
     #[derive(Deserialize)]
     struct Reply {
         data: Option<Data>,
@@ -340,18 +467,53 @@ fn fetch_diff_stats(
         iid: String,
         #[serde(rename = "diffStatsSummary")]
         diff_stats_summary: Option<Summary>,
+        #[serde(rename = "userNotesCount", default)]
+        user_notes_count: u64,
+        #[serde(default)]
+        notes: Option<Notes>,
+        #[serde(rename = "approvedBy", default)]
+        approved_by: Option<Approvers>,
+    }
+    #[derive(Deserialize)]
+    struct Approvers {
+        #[serde(default)]
+        nodes: Vec<Approver>,
+    }
+    #[derive(Deserialize)]
+    struct Approver {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        username: String,
     }
     #[derive(Deserialize)]
     struct Summary {
         additions: u64,
         deletions: u64,
     }
+    #[derive(Deserialize)]
+    struct Notes {
+        #[serde(default)]
+        nodes: Vec<Note>,
+    }
+    #[derive(Deserialize)]
+    struct Note {
+        #[serde(default)]
+        system: bool,
+        #[serde(default)]
+        author: Option<NoteAuthor>,
+    }
+    #[derive(Deserialize)]
+    struct NoteAuthor {
+        #[serde(default)]
+        username: String,
+    }
     if iids.is_empty() {
         return Ok(HashMap::new());
     }
     let iids: Vec<String> = iids.iter().map(|iid| format!("\"{iid}\"")).collect();
     let query = format!(
-        "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid diffStatsSummary {{ additions deletions }} }} }} }} }}",
+        "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid userNotesCount diffStatsSummary {{ additions deletions }} approvedBy {{ nodes {{ name username }} }} notes(first: 100) {{ nodes {{ system author {{ username }} }} }} }} }} }} }}",
         project.path,
         iids.join(",")
     );
@@ -369,43 +531,50 @@ fn fetch_diff_stats(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|node| {
-            let summary = node.diff_stats_summary?;
+            let (additions, deletions) = node
+                .diff_stats_summary
+                .map(|summary| (summary.additions, summary.deletions))
+                .unwrap_or_default();
+            let my_comment_count = node
+                .notes
+                .as_ref()
+                .map(|notes| {
+                    notes
+                        .nodes
+                        .iter()
+                        .filter(|note| {
+                            !note.system
+                                && note
+                                    .author
+                                    .as_ref()
+                                    .is_some_and(|author| author.username == username)
+                        })
+                        .count() as u64
+                })
+                .unwrap_or_default();
+            let approvers = node
+                .approved_by
+                .map(|approvers| approvers.nodes)
+                .unwrap_or_default();
+            let user_has_approved = approvers
+                .iter()
+                .any(|approver| approver.username == username);
             Some((
                 node.iid.parse().ok()?,
-                (summary.additions, summary.deletions),
+                Details {
+                    additions,
+                    deletions,
+                    comment_count: node.user_notes_count,
+                    my_comment_count,
+                    approved_by: approvers
+                        .into_iter()
+                        .map(|approver| approver.name)
+                        .collect(),
+                    user_has_approved,
+                },
             ))
         })
         .collect())
-}
-
-fn fetch_approvals(endpoint: &str, token: &str) -> Result<Approvals> {
-    #[derive(Deserialize)]
-    struct Reply {
-        #[serde(default)]
-        approved_by: Vec<Approver>,
-        #[serde(default)]
-        user_has_approved: bool,
-    }
-    #[derive(Deserialize)]
-    struct Approver {
-        #[serde(default)]
-        user: Option<Author>,
-    }
-    let reply: Reply = agent()
-        .get(endpoint)
-        .set("PRIVATE-TOKEN", token)
-        .call()
-        .map_err(|error| anyhow!("fetching approvals: {error}"))?
-        .into_json()
-        .context("the approvals reply is not the expected JSON")?;
-    Ok(Approvals {
-        approved_by: reply
-            .approved_by
-            .into_iter()
-            .filter_map(|approver| approver.user.map(|user| user.name))
-            .collect(),
-        user_has_approved: reply.user_has_approved,
-    })
 }
 
 fn now_seconds() -> u64 {
@@ -539,6 +708,13 @@ mod tests {
             user_has_approved: false,
             additions: 0,
             deletions: 0,
+            comment_count: 0,
+            my_comment_count: 0,
+            diff_refs: None,
+            draft: false,
+            mine: false,
+            counted_sha: None,
+            details_current: false,
         }
     }
 
