@@ -12,11 +12,7 @@ use std::{
 /// happened, for the picker's status, since it runs while the picker owns
 /// the terminal.
 pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Result<String> {
-    let zed_app = zed_app.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join("Applications/Zed Dev.app")
-    });
+    let zed_app = zed_app.unwrap_or_else(|| PathBuf::from("/Applications/Zed.app"));
     // The list may be hours old. A parent merge request merging retargets
     // this one and deletes the branch it was diffed against, so ask GitLab
     // for the merge request as it is now before checking anything out.

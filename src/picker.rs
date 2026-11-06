@@ -32,8 +32,6 @@ enum FetchStage {
     Detailed(Vec<MergeRequest>),
     /// Line counts retaken from the clone after a fetch.
     Counted(Vec<MergeRequest>),
-    /// A line for the footer, from warming Zed's order cache.
-    Status(String),
     Done,
 }
 
@@ -258,9 +256,7 @@ impl Picker {
                 // Last, and after the list is reported done: the model is
                 // asked for the reading order of the top few, so Zed can
                 // show it at once when one is opened.
-                for line in crate::warm::warm_order_cache(&project, &list, 3) {
-                    send(Ok(FetchStage::Status(line)));
-                }
+                crate::warm::warm_order_cache(&project, &list, 3);
             });
         }
         self.pending_fetches = self.projects.len();
@@ -323,10 +319,6 @@ impl Picker {
                         FetchStage::Listed(list)
                         | FetchStage::Detailed(list)
                         | FetchStage::Counted(list) => list,
-                        FetchStage::Status(line) => {
-                            self.status = line;
-                            continue;
-                        }
                         FetchStage::Done => {
                             self.pending_fetches = self.pending_fetches.saturating_sub(1);
                             if self.pending_fetches == 0 && !self.status.starts_with("could not") {

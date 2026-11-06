@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     assignee: bool,
 
-    /// The Zed app bundle to open. Defaults to ~/Applications/Zed Dev.app.
+    /// The Zed app bundle to open. Defaults to /Applications/Zed.app.
     #[arg(long, env = "ZED_APP")]
     zed_app: Option<PathBuf>,
 

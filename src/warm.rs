@@ -67,29 +67,20 @@ fn cache_file(work_dir: &Path, base_ref: &str, head_sha: &str) -> Option<PathBuf
 }
 
 /// Writes an order for each of the first `limit` merge requests that are
-/// not the user's own and have none cached. Returns a line per merge
-/// request warmed, for the footer. Without `ANTHROPIC_API_KEY` it does
-/// nothing.
+/// not the user's own and have none cached. Quiet by design: warming is a
+/// nicety, so neither success nor failure is worth a status line. Without
+/// `ANTHROPIC_API_KEY` it does nothing.
 pub fn warm_order_cache(
     project: &Project,
     merge_requests: &[MergeRequest],
     limit: usize,
-) -> Vec<String> {
+) {
     let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
-        return Vec::new();
+        return;
     };
-    let mut warmed = Vec::new();
     for merge_request in merge_requests.iter().filter(|mr| !mr.mine).take(limit) {
-        match warm_one(project, merge_request, &api_key) {
-            Ok(true) => warmed.push(format!("warmed the order for !{}", merge_request.iid)),
-            Ok(false) => {}
-            Err(error) => warmed.push(format!(
-                "could not warm the order for !{}: {error:#}",
-                merge_request.iid
-            )),
-        }
+        warm_one(project, merge_request, &api_key).ok();
     }
-    warmed
 }
 
 /// Warms one merge request by iid, for `changewalk --warm`.
