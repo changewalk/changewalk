@@ -1,6 +1,6 @@
 //! The terminal list of merge requests.
 
-use crate::gitlab::{self, LastOpened, MergeRequest, Project, Role};
+use crate::forge::{self, Forge, LastOpened, MergeRequest, Project, Role};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -91,7 +91,7 @@ pub fn run(
 ) -> Result<()> {
     let nothing_cached = cached.is_empty();
     let mut picker = Picker {
-        items: gitlab::order_as_stacks(cached, &default_branches),
+        items: forge::order_as_stacks(cached, &default_branches),
         selected: 0,
         description_scroll: 0,
         description_max_scroll: std::cell::Cell::new(0),
@@ -99,7 +99,7 @@ pub fn run(
         status: "press r to refresh".into(),
         pending_fetches: 0,
         default_branches,
-        last_opened: gitlab::last_opened(),
+        last_opened: forge::last_opened(),
         projects,
         role,
         fetches: None,
@@ -177,8 +177,8 @@ impl Picker {
         let Some(merge_request) = self.items.get(self.selected).cloned() else {
             return;
         };
-        self.status = format!("opening !{} in Zed…", merge_request.iid);
-        self.last_opened = Some(gitlab::remember_opened(&merge_request));
+        self.status = format!("opening {} in Zed…", merge_request.number());
+        self.last_opened = Some(forge::remember_opened(&merge_request));
         let (sender, receiver) = mpsc::channel();
         let launcher = launcher.clone();
         thread::spawn(move || {
@@ -207,7 +207,7 @@ impl Picker {
                 .collect();
             thread::spawn(move || {
                 let send = |stage: Result<FetchStage>| sender.send((project.clone(), stage)).ok();
-                let mut list = match gitlab::fetch_lists(&project, role, &cached) {
+                let mut list = match forge::fetch_lists(&project, role, &cached) {
                     Ok(list) => list,
                     Err(error) => {
                         send(Err(error));
@@ -216,14 +216,14 @@ impl Picker {
                     }
                 };
                 send(Ok(FetchStage::Listed(list.clone())));
-                if let Err(error) = gitlab::fill_details(&project, &mut list) {
+                if let Err(error) = forge::fill_details(&project, &mut list) {
                     send(Err(error));
                 }
                 send(Ok(FetchStage::Detailed(list.clone())));
                 // A fetch from a moment ago, as a launch does, is good enough.
-                if !gitlab::git_fetched_recently(&project) {
-                    match gitlab::git(&project.repo, &["fetch", "--prune", "origin"]) {
-                        Ok(_) => gitlab::mark_git_fetched(&project),
+                if !forge::git_fetched_recently(&project) {
+                    match forge::git(&project.repo, &["fetch", "--prune", "origin"]) {
+                        Ok(_) => forge::mark_git_fetched(&project),
                         Err(error) => {
                             send(Err(error));
                         }
@@ -233,7 +233,7 @@ impl Picker {
                 // squash-merged parent's work again; count the diff Zed will
                 // show, but only where the branch has moved since last time.
                 for merge_request in &mut list {
-                    let tip = gitlab::git(
+                    let tip = forge::git(
                         &project.repo,
                         &[
                             "rev-parse",
@@ -250,7 +250,7 @@ impl Picker {
                         merge_request.counted_sha = tip;
                     }
                 }
-                gitlab::write_cache(&project, &list);
+                forge::write_cache(&project, &list);
                 send(Ok(FetchStage::Counted(list.clone())));
                 send(Ok(FetchStage::Done));
                 // Last, and after the list is reported done: the model is
@@ -291,6 +291,24 @@ impl Picker {
             self.refresh();
             self.status = format!("{message} · refreshing…");
         }
+    }
+
+    /// The one host everything on screen is on, or None when the listed
+    /// projects are on both.
+    fn forge(&self) -> Option<Forge> {
+        let mut forges = self
+            .projects
+            .iter()
+            .map(|project| project.forge)
+            .chain(self.items.iter().map(|mr| mr.forge));
+        let first = forges.next()?;
+        forges.all(|forge| forge == first).then_some(first)
+    }
+
+    /// `Merge requests`, `Pull requests`, or `Changes` when both hosts are
+    /// listed at once.
+    fn plural_noun(&self) -> &'static str {
+        self.forge().map_or("Changes", Forge::plural_noun)
     }
 
     fn is_last_opened(&self, merge_request: &MergeRequest) -> bool {
@@ -337,7 +355,7 @@ impl Picker {
                         .filter(|mr| mr.repo != project.repo)
                         .collect();
                     items.extend(fresh);
-                    self.items = gitlab::order_as_stacks(items, &self.default_branches);
+                    self.items = forge::order_as_stacks(items, &self.default_branches);
                     self.selected = selected_iid
                         .and_then(|iid| self.items.iter().position(|mr| mr.iid == iid))
                         .unwrap_or(0);
@@ -369,7 +387,7 @@ impl Picker {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(DIM))
             .title(Line::from(vec![
-                Span::raw(" Merge requests to review · "),
+                Span::raw(format!(" {} to review · ", self.plural_noun())),
                 Span::styled(self.title.clone(), Style::default().bold()),
                 Span::raw(" "),
             ]));
@@ -396,7 +414,7 @@ impl Picker {
                 ),
                 Span::styled(guide, Style::default().fg(DIM)),
                 Span::styled(
-                    format!("!{}", mr.iid),
+                    mr.number(),
                     Style::default().fg(if opened { OPENED } else { NUMBER }),
                 ),
                 Span::styled(
@@ -422,9 +440,10 @@ impl Picker {
             };
             let target = if mr.stacked {
                 match parent_by_source.get(&(&mr.repo, mr.target_branch.as_str())) {
-                    Some(parent) => {
-                        Span::styled(format!("↑ !{parent}"), Style::default().fg(STACKED))
-                    }
+                    Some(parent) => Span::styled(
+                        format!("↑ {}", mr.forge.number(*parent)),
+                        Style::default().fg(STACKED),
+                    ),
                     None => Span::styled(
                         format!("↑ {}", mr.target_branch),
                         Style::default().fg(STACKED),
@@ -484,7 +503,7 @@ impl Picker {
         let mut footer = vec![
             key_hint("↑↓", "move"),
             key_hint("⏎", "open in Zed"),
-            key_hint("g", "GitLab"),
+            key_hint("g", self.forge().map_or("open", Forge::name)),
             key_hint("r", "refresh"),
             key_hint("u/d", "scroll"),
             key_hint("q", "quit"),
@@ -494,8 +513,8 @@ impl Picker {
         {
             footer.push(Span::styled(
                 format!(
-                    " {OPENED_MARK} !{} opened {} ",
-                    merge_request.iid,
+                    " {OPENED_MARK} {} opened {} ",
+                    merge_request.number(),
                     local_time(&opened.at)
                 ),
                 Style::default().fg(OPENED),
@@ -507,8 +526,9 @@ impl Picker {
         ));
         let footer = Line::from(footer);
         let Some(merge_request) = self.items.get(self.selected) else {
-            let text = if self.pending_fetches == 0 {
-                " No open merge requests."
+            let loading = format!(" No open {}.", self.plural_noun().to_lowercase());
+            let text: &str = if self.pending_fetches == 0 {
+                &loading
             } else {
                 " Loading…"
             };
@@ -527,10 +547,7 @@ impl Picker {
             .border_style(Style::default().fg(DIM))
             .title(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(
-                    format!("!{}", merge_request.iid),
-                    Style::default().fg(NUMBER),
-                ),
+                Span::styled(merge_request.number(), Style::default().fg(NUMBER)),
                 Span::raw(" · "),
                 Span::styled(merge_request.title.clone(), Style::default().bold()),
                 Span::raw(" "),
@@ -803,7 +820,7 @@ mod tests {
             description: Some(
                 "## Why\n\nA `reply` becomes a **stored** result.\n- one\n- two".into(),
             ),
-            author: Some(crate::gitlab::Author {
+            author: Some(crate::forge::Author {
                 name: "Tim Barnes".into(),
                 username: "tim".into(),
             }),
@@ -812,6 +829,7 @@ mod tests {
             updated_at: "2026-10-19T10:00:00Z".into(),
             web_url: "https://gitlab.com/x/-/merge_requests/1628".into(),
             repo: PathBuf::from("/r"),
+            forge: Forge::Gitlab,
             depth,
             stacked: target != "main",
             approved_by: if depth == 0 {
@@ -891,6 +909,70 @@ mod tests {
         assert!(text.contains("19 Oct 1"));
         assert!(text.contains(" Why"));
         assert!(text.contains("• one"));
+    }
+
+    /// The same screen for a GitHub repository calls things what GitHub
+    /// calls them: `#1628`, not `!1628`, and pull requests, not merge
+    /// requests.
+    #[test]
+    fn a_github_list_is_headed_and_numbered_githubs_way() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let picker = Picker {
+            items: vec![MergeRequest {
+                iid: 1628,
+                title: "Read a reply as a result".into(),
+                description: Some("Because.".into()),
+                author: Some(crate::forge::Author {
+                    name: "ada".into(),
+                    username: "ada".into(),
+                }),
+                source_branch: "ada/reply".into(),
+                target_branch: "main".into(),
+                updated_at: "2026-10-19T10:00:00Z".into(),
+                web_url: "https://github.com/owner/repo/pull/1628".into(),
+                repo: PathBuf::from("/r"),
+                forge: Forge::Github,
+                depth: 0,
+                stacked: false,
+                approved_by: vec!["bob".into()],
+                user_has_approved: false,
+                additions: 12,
+                deletions: 3,
+                comment_count: 2,
+                my_comment_count: 1,
+                diff_refs: None,
+                draft: false,
+                mine: false,
+                counted_sha: None,
+                details_current: false,
+            }],
+            selected: 0,
+            description_scroll: 0,
+            description_max_scroll: std::cell::Cell::new(0),
+            title: "owner/repo".into(),
+            status: "up to date".into(),
+            pending_fetches: 0,
+            default_branches: HashMap::new(),
+            projects: Vec::new(),
+            role: Role::Reviewer,
+            fetches: None,
+            last_opened: None,
+            launching: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
+        terminal.draw(|frame| picker.draw(frame)).unwrap();
+        let text: String = (0..20)
+            .map(|y| {
+                (0..130)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Pull requests to review"), "{text}");
+        assert!(text.contains("▶ #1628"), "{text}");
+        assert!(text.contains("g GitHub"), "{text}");
+        assert!(!text.contains("!1628"), "{text}");
     }
 
     #[test]

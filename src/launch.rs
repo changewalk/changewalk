@@ -1,6 +1,6 @@
 //! Checking the merge request's branch out and opening it in Zed.
 
-use crate::gitlab::{self, MergeRequest, Project, git};
+use crate::forge::{self, MergeRequest, Project, git};
 use anyhow::{Context as _, Result, bail};
 use std::{
     path::{Path, PathBuf},
@@ -11,13 +11,12 @@ use std::{
 /// the diff with a suggested review order. Returns a line saying what
 /// happened, for the picker's status, since it runs while the picker owns
 /// the terminal.
-pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Result<String> {
-    let zed_app = zed_app.unwrap_or_else(|| PathBuf::from("/Applications/Zed.app"));
-    // The list may be hours old. A parent merge request merging retargets
-    // this one and deletes the branch it was diffed against, so ask GitLab
-    // for the merge request as it is now before checking anything out.
-    let fresh = Project::discover(&merge_request.repo)
-        .and_then(|project| gitlab::fetch_merge_request(&project, merge_request.iid));
+pub fn open_in_zed(merge_request: &MergeRequest, zed_app: &Path) -> Result<String> {
+    // The list may be hours old. A parent change merging retargets this one
+    // and deletes the branch it was diffed against, so ask the host for the
+    // change as it is now before checking anything out.
+    let fresh = Project::discover(&merge_request.repo, merge_request.forge)
+        .and_then(|project| forge::fetch_merge_request(&project, merge_request.iid));
     let (merge_request, mut warning) = match fresh {
         Ok(fresh) => {
             let mut fresh = fresh;
@@ -26,7 +25,10 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Re
         }
         Err(error) => (
             merge_request.clone(),
-            Some(format!("using the cached merge request: {error:#}")),
+            Some(format!(
+                "using the cached {}: {error:#}",
+                merge_request.forge.noun()
+            )),
         ),
     };
     let mut merge_request = merge_request;
@@ -60,7 +62,7 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Re
     // A freshly launched app does not inherit the shell's environment, so
     // pass the model key through. A running app keeps the environment it
     // started with, and `open` warns if asked to change it, so skip it then.
-    if !zed_is_running(&zed_app) {
+    if !zed_is_running(zed_app) {
         for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
             if let Ok(value) = std::env::var(key) {
                 open.arg("--env").arg(format!("{key}={value}"));
@@ -69,7 +71,7 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Re
     }
     let status = open
         .arg("-a")
-        .arg(&zed_app)
+        .arg(zed_app)
         .arg(&url)
         .status()
         .context("running open")?;
@@ -77,8 +79,9 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: Option<PathBuf>) -> Re
         bail!("could not open {}", zed_app.display());
     }
     let mut message = format!(
-        "opened !{} ({}) in Zed",
-        merge_request.iid, merge_request.source_branch
+        "opened {} ({}) in Zed",
+        merge_request.number(),
+        merge_request.source_branch
     );
     if let Some(warning) = warning {
         message.push_str(" · ");
@@ -216,8 +219,8 @@ fn check_out(merge_request: &MergeRequest) -> Result<Option<String>> {
         && git(repo, &["fetch", "origin", source, target]).is_err()
     {
         git(repo, &["fetch", "origin", source])?;
-    } else if let Ok(project) = Project::discover(repo) {
-        gitlab::mark_git_fetched(&project);
+    } else if let Ok(project) = Project::discover(repo, merge_request.forge) {
+        forge::mark_git_fetched(&project);
     }
 
     let remote = format!("origin/{source}");
@@ -241,8 +244,9 @@ fn check_out(merge_request: &MergeRequest) -> Result<Option<String>> {
     Ok(warning)
 }
 
-/// Writes the merge request as JSON for Zed to show above the diff, which
-/// saves Zed two round trips to GitLab.
+/// Writes the change as JSON for Zed to show above the diff, which saves
+/// Zed two round trips to the host. The shape is GitLab's, which is what
+/// the Zed fork reads; a pull request is written in the same shape.
 fn write_merge_request_file(merge_request: &MergeRequest) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join("changewalk");
     std::fs::create_dir_all(&dir).context("creating the temporary directory")?;
@@ -289,6 +293,7 @@ mod tests {
             updated_at: String::new(),
             web_url: String::new(),
             repo: repo.to_path_buf(),
+            forge: crate::forge::Forge::Gitlab,
             depth: 0,
             stacked: target != "main",
             approved_by: Vec::new(),

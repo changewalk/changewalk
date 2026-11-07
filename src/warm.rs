@@ -7,7 +7,7 @@
 //! cache file, keyed by clone, base, and commit. The prompt files are
 //! copies of the fork's; keep them in step.
 
-use crate::gitlab::{MergeRequest, Project, git};
+use crate::forge::{MergeRequest, Project, git};
 use crate::launch;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -70,11 +70,7 @@ fn cache_file(work_dir: &Path, base_ref: &str, head_sha: &str) -> Option<PathBuf
 /// not the user's own and have none cached. Quiet by design: warming is a
 /// nicety, so neither success nor failure is worth a status line. Without
 /// `ANTHROPIC_API_KEY` it does nothing.
-pub fn warm_order_cache(
-    project: &Project,
-    merge_requests: &[MergeRequest],
-    limit: usize,
-) {
+pub fn warm_order_cache(project: &Project, merge_requests: &[MergeRequest], limit: usize) {
     let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
         return;
     };
@@ -172,7 +168,7 @@ fn warm_one(project: &Project, merge_request: &MergeRequest, api_key: &str) -> R
             .map(|(path, raw)| (path, notes_of(raw)))
             .collect(),
         Err(error) => {
-            eprintln!("notes for !{}: {error:#}", merge_request.iid);
+            eprintln!("notes for {}: {error:#}", merge_request.number());
             HashMap::new()
         }
     };

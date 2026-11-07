@@ -1,53 +1,69 @@
-//! Pick an open GitLab merge request you review, and open its diff in Zed with
-//! a suggested review order, guiding notes, and the merge request description
-//! above the files.
+//! Pick an open merge or pull request you review, and open its diff in Zed
+//! with a suggested review order, guiding notes, and the change's
+//! description above the files.
 
+mod config;
+mod forge;
+mod github;
 mod gitlab;
 mod launch;
+mod onboarding;
 mod picker;
 mod warm;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use gitlab::{MergeRequest, Project, Role};
+use forge::{MergeRequest, Project, Role};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
-/// Pick a GitLab merge request you review and open it in Zed in review order.
+/// Pick a merge or pull request you review and open it in Zed in review
+/// order.
 ///
-/// Arrow keys move, Enter checks the branch out and opens Zed while the list
-/// stays open, `g` opens the merge request in GitLab, `r` refreshes the list
-/// from GitLab, `u` and `d` scroll the description, `q` quits. Stacked merge
-/// requests sit under the one they are stacked on and are diffed against that
-/// branch rather than the default branch.
+/// Arrow keys move, Enter checks the branch out and opens Zed while the
+/// list stays open, `g` opens the change on GitLab or GitHub, `r` refreshes
+/// the list, `u` and `d` scroll the description, `q` quits. Stacked changes
+/// sit under the one they are stacked on and are diffed against that branch
+/// rather than the default branch.
+///
+/// The first run asks which host you review on and which editor to read
+/// reviews in; `--onboard` asks again.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// List merge requests assigned to you instead of ones you review.
+    /// List changes assigned to you instead of ones you review.
     #[arg(long)]
     assignee: bool,
 
-    /// The Zed app bundle to open. Defaults to /Applications/Zed.app.
+    /// Ask again which host and editor to use, then exit.
+    #[arg(long)]
+    onboard: bool,
+
+    /// The Zed app bundle to open. Defaults to the one onboarding found.
     #[arg(long, env = "ZED_APP")]
     zed_app: Option<PathBuf>,
 
-    /// Open this merge request in Zed straight away, without the list.
-    #[arg(long, value_name = "IID")]
+    /// Open this change in Zed straight away, without the list.
+    #[arg(long, value_name = "NUMBER")]
     open: Option<u64>,
 
-    /// Write the Zed reading order for this merge request and exit.
-    #[arg(long, value_name = "IID")]
+    /// Write the Zed reading order for this change and exit.
+    #[arg(long, value_name = "NUMBER")]
     warm: Option<u64>,
 
-    /// Repositories to list merge requests from. Defaults to $CHANGEWALK_REPOS
+    /// Repositories to list changes from. Defaults to $CHANGEWALK_REPOS
     /// (colon separated), else the current directory.
     repos: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let config = onboarding::configure(args.onboard)?;
+    if args.onboard {
+        return Ok(());
+    }
     let role = if args.assignee {
         Role::Assignee
     } else {
@@ -55,34 +71,34 @@ fn main() -> Result<()> {
     };
     let projects = repositories(args.repos)?
         .iter()
-        .map(|repo| Project::discover(repo))
+        .map(|repo| Project::discover(repo, config.forge))
         .collect::<Result<Vec<_>>>()?;
     let default_branches: HashMap<PathBuf, String> = projects
         .iter()
         .map(|project| (project.repo.clone(), project.default_branch.clone()))
         .collect();
 
-    // The last list shows straight away from the cache; `r` asks GitLab for
-    // a fresh one.
+    // The last list shows straight away from the cache; `r` asks the host
+    // for a fresh one.
     let cached: Vec<MergeRequest> = projects
         .iter()
-        .flat_map(gitlab::cached_merge_requests)
+        .flat_map(forge::cached_merge_requests)
         .collect();
     let title = projects
         .iter()
         .map(|project| project.path.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let zed_app = args.zed_app;
+    let app = args.zed_app.unwrap_or_else(|| config.app());
     if let Some(iid) = args.warm {
         let (project, merge_request) = projects
             .iter()
             .find_map(|project| {
-                gitlab::fetch_merge_request(project, iid)
+                forge::fetch_merge_request(project, iid)
                     .ok()
                     .map(|mr| (project, mr))
             })
-            .with_context(|| format!("no merge request !{iid} in the listed projects"))?;
+            .with_context(|| format!("no change {iid} in the listed projects"))?;
         let written = warm::warm_by_iid(project, &merge_request)?;
         println!(
             "{}",
@@ -102,10 +118,10 @@ fn main() -> Result<()> {
             .or_else(|| {
                 projects
                     .iter()
-                    .find_map(|project| gitlab::fetch_merge_request(project, iid).ok())
+                    .find_map(|project| forge::fetch_merge_request(project, iid).ok())
             })
-            .with_context(|| format!("no merge request !{iid} in the listed projects"))?;
-        println!("{}", launch::open_in_zed(&merge_request, zed_app)?);
+            .with_context(|| format!("no change {iid} in the listed projects"))?;
+        println!("{}", launch::open_in_zed(&merge_request, &app)?);
         return Ok(());
     }
     picker::run(
@@ -114,7 +130,7 @@ fn main() -> Result<()> {
         role,
         default_branches,
         title,
-        move |merge_request| launch::open_in_zed(merge_request, zed_app.clone()),
+        move |merge_request| launch::open_in_zed(merge_request, &app),
     )
 }
 
@@ -143,7 +159,7 @@ fn repositories(args: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub fn expand_home(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), dirs::home_dir()) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => Path::new(path).to_path_buf(),
