@@ -256,7 +256,7 @@ impl Picker {
                 // Last, and after the list is reported done: the model is
                 // asked for the reading order of the top few, so Zed can
                 // show it at once when one is opened.
-                crate::warm::warm_order_cache(&project, &list, 3);
+                crate::warm::warm_order_cache(&project, &list, 5);
             });
         }
         self.pending_fetches = self.projects.len();
