@@ -91,6 +91,26 @@ impl Config {
         serde_json::from_str(&text).ok()
     }
 
+    /// Deletes the saved configuration so the next run onboards afresh, and
+    /// removes the `changewalk` directory if nothing else is left in it.
+    /// Returns the file removed, or None when there was none to remove.
+    pub fn reset() -> Result<Option<PathBuf>> {
+        let path = Self::path().context("no configuration directory for this user")?;
+        Self::reset_at(&path)
+    }
+
+    fn reset_at(path: &Path) -> Result<Option<PathBuf>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        if let Some(dir) = path.parent() {
+            // Only if empty: a future version might keep more here.
+            std::fs::remove_dir(dir).ok();
+        }
+        Ok(Some(path.to_path_buf()))
+    }
+
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::path().context("no configuration directory for this user")?;
         self.save_to(&path)?;
@@ -157,6 +177,29 @@ mod tests {
         let read: Config = serde_json::from_str(&written).unwrap();
         assert_eq!(read.forge, Forge::Github);
         assert_eq!(read.app, config.app);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reset removes the file and the directory it was alone in, and says
+    /// nothing was there when run a second time.
+    #[test]
+    fn reset_forgets_the_saved_configuration() {
+        let dir = std::env::temp_dir().join(format!("changewalk-reset-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let file = dir.join("changewalk").join("config.json");
+
+        // Nothing saved: nothing to forget, and no error.
+        assert_eq!(Config::reset_at(&file).unwrap(), None);
+
+        Config::default().save_to(&file).unwrap();
+        assert!(file.exists());
+        assert_eq!(Config::reset_at(&file).unwrap(), Some(file.clone()));
+        assert!(!file.exists());
+        // The empty parent went too.
+        assert!(!file.parent().unwrap().exists());
+        // A second reset is a quiet no-op.
+        assert_eq!(Config::reset_at(&file).unwrap(), None);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

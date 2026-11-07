@@ -264,10 +264,33 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Where the list caches, usernames, last-opened marker, and fetch stamps
+/// live. Not created; use [`cache_dir`] when about to write.
+pub fn cache_dir_path() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("changewalk"))
+}
+
 pub fn cache_dir() -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("changewalk");
+    let dir = cache_dir_path()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Removes the whole cache directory, so the next run fetches every list
+/// fresh and forgets the last-opened marker and cached usernames. The
+/// saved configuration is left alone. Returns the directory removed, or
+/// None when there was nothing cached.
+pub fn reset_cache() -> Result<Option<PathBuf>> {
+    let dir = cache_dir_path().context("no cache directory for this user")?;
+    reset_cache_at(&dir)
+}
+
+fn reset_cache_at(dir: &Path) -> Result<Option<PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+    Ok(Some(dir.to_path_buf()))
 }
 
 /// The change most recently opened in the editor from the picker, kept
@@ -680,6 +703,25 @@ mod tests {
             counted_sha: None,
             details_current: false,
         }
+    }
+
+    /// Clearing the cache removes the whole directory and its files, and
+    /// is a quiet no-op when there is nothing cached.
+    #[test]
+    fn reset_cache_removes_the_whole_directory() {
+        let dir = std::env::temp_dir().join(format!("changewalk-cache-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Nothing cached: nothing to clear.
+        assert_eq!(reset_cache_at(&dir).unwrap(), None);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gitlab.com__group__project.json"), "[]").unwrap();
+        std::fs::write(dir.join("last_opened.json"), "{}").unwrap();
+        assert_eq!(reset_cache_at(&dir).unwrap(), Some(dir.clone()));
+        assert!(!dir.exists());
+        // A second run finds nothing left.
+        assert_eq!(reset_cache_at(&dir).unwrap(), None);
     }
 
     #[test]

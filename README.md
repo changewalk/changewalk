@@ -53,6 +53,13 @@ Zed is the only editor that can show a review so far, so there is nothing else
 to pick yet. The choice is stored anyway, along with the app bundle onboarding
 found, so a second editor is a matter of listing it.
 
+To start over, `changewalk --reset-config` forgets the host and editor so the
+next run onboards afresh, and `changewalk --reset-cache` clears the cached
+lists, usernames, and last-opened marker so the next run fetches fresh. The two
+are independent and can be given together. Each lists what it will delete and
+asks before doing it; `--yes` (or `-y`) answers for you, and with no terminal to
+ask in nothing is deleted unless `--yes` is passed.
+
 ## Requirements
 
 - For GitLab: `glab`, logged in (`glab auth login`), or a `GITLAB_TOKEN` in the

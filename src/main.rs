@@ -41,6 +41,20 @@ struct Args {
     #[arg(long)]
     onboard: bool,
 
+    /// Forget the saved host and editor, so the next run onboards afresh,
+    /// then exit.
+    #[arg(long)]
+    reset_config: bool,
+
+    /// Clear the cached lists, usernames, and last-opened marker, so the
+    /// next run fetches fresh, then exit.
+    #[arg(long)]
+    reset_cache: bool,
+
+    /// Answer yes to the reset confirmation, for scripts and pipelines.
+    #[arg(long, short = 'y')]
+    yes: bool,
+
     /// The Zed app bundle to open. Defaults to the one onboarding found.
     #[arg(long, env = "ZED_APP")]
     zed_app: Option<PathBuf>,
@@ -60,6 +74,11 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // These run before onboarding, so clearing the config does not at once
+    // ask to fill it in again.
+    if args.reset_config || args.reset_cache {
+        return reset(args.reset_config, args.reset_cache, args.yes);
+    }
     let config = onboarding::configure(args.onboard)?;
     if args.onboard {
         return Ok(());
@@ -132,6 +151,74 @@ fn main() -> Result<()> {
         title,
         move |merge_request| launch::open_in_zed(merge_request, &app),
     )
+}
+
+/// Forgets the saved configuration and clears the cache, as asked. Each is
+/// a deletion, so the user is told what will go and asked to confirm first,
+/// unless `yes` was passed or there is nothing to delete.
+fn reset(reset_config: bool, reset_cache: bool, yes: bool) -> Result<()> {
+    let config_path = reset_config
+        .then(config::Config::path)
+        .flatten()
+        .filter(|path| path.exists());
+    let cache_path = reset_cache
+        .then(forge::cache_dir_path)
+        .flatten()
+        .filter(|path| path.exists());
+
+    if config_path.is_none() && cache_path.is_none() {
+        if reset_config {
+            println!("no saved host and editor to forget");
+        }
+        if reset_cache {
+            println!("no cache to clear");
+        }
+        return Ok(());
+    }
+
+    // Name what is about to go before asking, so the answer is informed.
+    println!("This will delete:");
+    if let Some(path) = &config_path {
+        println!("  the saved host and editor  {}", path.display());
+    }
+    if let Some(path) = &cache_path {
+        println!("  the cached lists and marks {}", path.display());
+    }
+    if !yes && !confirm("Delete these? [y/N] ")? {
+        println!("left everything as it is");
+        return Ok(());
+    }
+
+    if config_path.is_some()
+        && let Some(path) = config::Config::reset()?
+    {
+        println!("forgot the saved host and editor ({})", path.display());
+    }
+    if cache_path.is_some()
+        && let Some(dir) = forge::reset_cache()?
+    {
+        println!("cleared the cache ({})", dir.display());
+    }
+    Ok(())
+}
+
+/// Asks `prompt` and reads a yes. A `y` or `yes`, in any case, is yes;
+/// anything else, Enter included, is no. With no terminal to ask in, the
+/// answer is no, so a pipeline never deletes without `--yes`.
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() {
+        println!("not a terminal; pass --yes to confirm");
+        return Ok(false);
+    }
+    print!("{prompt}");
+    std::io::stdout().flush().context("writing the prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading the answer")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 fn repositories(args: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
