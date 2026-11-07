@@ -487,6 +487,7 @@ impl Picker {
             key_hint("g", "GitLab"),
             key_hint("r", "refresh"),
             key_hint("u/d", "scroll"),
+            key_hint("G", "last"),
             key_hint("q", "quit"),
         ];
         if let Some(opened) = &self.last_opened
