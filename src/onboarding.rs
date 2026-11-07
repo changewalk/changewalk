@@ -161,8 +161,7 @@ fn draw(frame: &mut Frame, step: Step, forge: usize, ide: usize) {
     // indent, which `Paragraph`'s own wrapping would drop. The borders and
     // the padding inside them both take room the text cannot use.
     let width = frame.area().width.min(PANEL_WIDTH);
-    let text_width =
-        usize::from(width.saturating_sub(2 + 2 * PAD_X)).max(16);
+    let text_width = usize::from(width.saturating_sub(2 + 2 * PAD_X)).max(16);
     let mut lines = vec![
         Line::from(Span::styled(
             format!("Step {number} of 2"),
