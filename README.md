@@ -35,7 +35,7 @@ except on a first run with nothing cached, when it fetches straight away.
 
 ## Requirements
 
-- `glab`, logged in (`glab auth login`), or a `GITLAB_TOKEN` in the environment.
+- `glab`, logged in with `glab auth login`, or a `GITLAB_TOKEN` exported in the environment.
 - A Zed build with the review changes, as an app bundle. Set `ZED_APP` or
   `--zed-app` to its path; the default is `~/Applications/Zed Dev.app`.
 - A model for Zed: an `ANTHROPIC_API_KEY` in the shell, passed to Zed when it is
