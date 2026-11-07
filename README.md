@@ -2,7 +2,7 @@
 
 # changewalk
 
-**Walk a GitLab or GitHub review in Zed — picked, ordered, and annotated.**
+**Walk a GitLab or GitHub review in Zed.**
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg)](https://www.rust-lang.org)
