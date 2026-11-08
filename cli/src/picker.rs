@@ -186,7 +186,11 @@ impl Picker {
         let Some(merge_request) = self.items.get(self.selected).cloned() else {
             return;
         };
-        self.status = format!("opening {} in {}…", merge_request.number(), self.editor_name);
+        self.status = format!(
+            "opening {} in {}…",
+            merge_request.number(),
+            self.editor_name
+        );
         self.last_opened = Some(forge::remember_opened(&merge_request));
         let (sender, receiver) = mpsc::channel();
         let launcher = launcher.clone();
