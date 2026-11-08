@@ -92,6 +92,26 @@ except on a first run with nothing cached, when it fetches straight away.
 - A model for Zed: an `ANTHROPIC_API_KEY` in the shell, passed to Zed when it is
   launched, or a key saved in Zed's agent settings.
 
+### The Zed build
+
+The review changes live in a fork, not in upstream Zed:
+
+- Repository: `git@github.com:changewalk/zed.git`
+- Branch: `git-diff-branch-view`, rebased onto upstream Zed each week.
+
+The fork is a sibling of this repository, as `../zed`. Build and install the app
+from it:
+
+```
+git clone git@github.com:changewalk/zed.git ../zed
+cd ../zed
+git checkout git-diff-branch-view
+script/bundle-mac -i   # installs to /Applications/Zed.app
+```
+
+Point changewalk at the app with `ZED_APP` or `--zed-app` if onboarding does not
+find it.
+
 ## Configuration
 
 The first run asks two questions: which host you review on, and which editor to
