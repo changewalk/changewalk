@@ -55,8 +55,8 @@ struct Args {
     #[arg(long, short = 'y')]
     yes: bool,
 
-    /// The Zed app bundle to open. Defaults to the one onboarding found.
-    #[arg(long, env = "ZED_APP")]
+    /// The editor app bundle to open. Defaults to the one onboarding found.
+    #[arg(long = "zed-app", visible_alias = "app", env = "ZED_APP")]
     zed_app: Option<PathBuf>,
 
     /// Open this change in Zed straight away, without the list.
@@ -140,16 +140,18 @@ fn main() -> Result<()> {
                     .find_map(|project| forge::fetch_merge_request(project, iid).ok())
             })
             .with_context(|| format!("no change {iid} in the listed projects"))?;
-        println!("{}", launch::open_in_zed(&merge_request, &app)?);
+        println!("{}", launch::open(config.ide, &merge_request, &app)?);
         return Ok(());
     }
+    let ide = config.ide;
     picker::run(
         cached,
         projects,
         role,
         default_branches,
         title,
-        move |merge_request| launch::open_in_zed(merge_request, &app),
+        ide,
+        move |merge_request| launch::open(ide, merge_request, &app),
     )
 }
 

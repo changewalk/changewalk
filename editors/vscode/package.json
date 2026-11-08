@@ -1,0 +1,46 @@
+{
+  "name": "changewalk",
+  "displayName": "changewalk",
+  "description": "Walk a GitLab or GitHub review in VS Code or Cursor.",
+  "version": "0.1.0",
+  "publisher": "changewalk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/changewalk/changewalk.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onUri"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "changewalk.openReviewFromFile",
+        "title": "changewalk: Open a review from a hand-off file"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "node esbuild.js --production",
+    "package": "vsce package --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}

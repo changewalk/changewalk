@@ -7,22 +7,26 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// The editors a review can be opened in. Only Zed knows how to show one
-/// so far; the choice is stored so adding another is a matter of listing
-/// it here.
+/// The editors a review can be opened in. Zed shows one through its fork;
+/// VS Code and Cursor share one extension (`editors/vscode`), launched by
+/// the same review URL under each editor's own scheme.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ide {
     #[default]
     Zed,
+    VsCode,
+    Cursor,
 }
 
 impl Ide {
-    pub const ALL: [Ide; 1] = [Ide::Zed];
+    pub const ALL: [Ide; 3] = [Ide::Zed, Ide::VsCode, Ide::Cursor];
 
     pub fn name(self) -> &'static str {
         match self {
             Ide::Zed => "Zed",
+            Ide::VsCode => "VS Code",
+            Ide::Cursor => "Cursor",
         }
     }
 
@@ -30,7 +34,47 @@ impl Ide {
     pub fn description(self) -> &'static str {
         match self {
             Ide::Zed => "opens the diff in review order, with notes and threads",
+            Ide::VsCode => "opens the diff through the changewalk extension",
+            Ide::Cursor => "opens the diff through the changewalk extension",
         }
+    }
+
+    /// The URL scheme the editor registers, which `open` hands the review
+    /// URL to. The VS Code extension handles whichever of `vscode` and
+    /// `cursor` launched it.
+    pub fn url_scheme(self) -> &'static str {
+        match self {
+            Ide::Zed => "zed",
+            Ide::VsCode => "vscode",
+            Ide::Cursor => "cursor",
+        }
+    }
+
+    /// The path after the scheme for a review URL. Zed has a built-in
+    /// `git/review` handler; VS Code and Cursor route to the extension by
+    /// its `publisher.name`.
+    pub fn review_path(self) -> &'static str {
+        match self {
+            Ide::Zed => "git/review",
+            Ide::VsCode | Ide::Cursor => "changewalk.changewalk/review",
+        }
+    }
+
+    /// Zed runs the review inside the editor and so wants the model key and
+    /// its own order cache; VS Code and Cursor are thin clients the CLI
+    /// feeds, so they want neither.
+    pub fn runs_review_in_editor(self) -> bool {
+        matches!(self, Ide::Zed)
+    }
+
+    /// Builds a `scheme://path?query` review URL, each value percent-encoded.
+    pub fn review_url(self, query: &[(&str, String)]) -> String {
+        let query = query
+            .iter()
+            .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{}://{}?{query}", self.url_scheme(), self.review_path())
     }
 
     /// Where the app usually is, most specific build first, so a
@@ -43,6 +87,11 @@ impl Ide {
                 "~/Applications/Zed.app",
                 "/Applications/Zed.app",
             ],
+            Ide::VsCode => &[
+                "/Applications/Visual Studio Code.app",
+                "~/Applications/Visual Studio Code.app",
+            ],
+            Ide::Cursor => &["/Applications/Cursor.app", "~/Applications/Cursor.app"],
         }
     }
 

@@ -1,5 +1,6 @@
 //! The terminal list of merge requests.
 
+use crate::config::Ide;
 use crate::forge::{self, Forge, LastOpened, MergeRequest, Project, Role};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -70,6 +71,11 @@ struct Picker {
     last_opened: Option<LastOpened>,
     projects: Vec<Project>,
     role: Role,
+    /// The editor reviews open in, for the status line and the key hint.
+    editor_name: &'static str,
+    /// Whether to warm Zed's order cache on a refresh. Only Zed reads it;
+    /// the thin clients get their order from the CLI instead.
+    warm: bool,
     /// Fresh lists arrive here while a refresh is running.
     fetches: Option<Receiver<FetchResult>>,
     /// The launch in progress, which runs on its own thread because the
@@ -87,6 +93,7 @@ pub fn run(
     role: Role,
     default_branches: HashMap<PathBuf, String>,
     title: String,
+    ide: Ide,
     launcher: impl Fn(&MergeRequest) -> Result<String> + Send + Sync + 'static,
 ) -> Result<()> {
     let nothing_cached = cached.is_empty();
@@ -102,6 +109,8 @@ pub fn run(
         last_opened: forge::last_opened(),
         projects,
         role,
+        editor_name: ide.name(),
+        warm: ide.runs_review_in_editor(),
         fetches: None,
         launching: None,
     };
@@ -177,7 +186,7 @@ impl Picker {
         let Some(merge_request) = self.items.get(self.selected).cloned() else {
             return;
         };
-        self.status = format!("opening {} in Zed…", merge_request.number());
+        self.status = format!("opening {} in {}…", merge_request.number(), self.editor_name);
         self.last_opened = Some(forge::remember_opened(&merge_request));
         let (sender, receiver) = mpsc::channel();
         let launcher = launcher.clone();
@@ -196,6 +205,7 @@ impl Picker {
             return;
         }
         let (sender, receiver) = mpsc::channel();
+        let warm = self.warm;
         for project in self.projects.clone() {
             let sender = sender.clone();
             let role = self.role;
@@ -255,8 +265,11 @@ impl Picker {
                 send(Ok(FetchStage::Done));
                 // Last, and after the list is reported done: the model is
                 // asked for the reading order of the top few, so Zed can
-                // show it at once when one is opened.
-                crate::warm::warm_order_cache(&project, &list, 3);
+                // show it at once when one is opened. Only Zed reads this
+                // cache; the thin clients get their order from the CLI.
+                if warm {
+                    crate::warm::warm_order_cache(&project, &list, 3);
+                }
             });
         }
         self.pending_fetches = self.projects.len();
@@ -502,7 +515,7 @@ impl Picker {
     fn draw_description(&self, frame: &mut Frame, area: Rect) {
         let mut footer = vec![
             key_hint("↑↓", "move"),
-            key_hint("⏎", "open in Zed"),
+            key_hint("⏎", &format!("open in {}", self.editor_name)),
             key_hint("g", self.forge().map_or("open", Forge::name)),
             key_hint("r", "refresh"),
             key_hint("u/d", "scroll"),
@@ -874,6 +887,8 @@ mod tests {
             default_branches: HashMap::new(),
             projects: Vec::new(),
             role: Role::Reviewer,
+            editor_name: "Zed",
+            warm: true,
             fetches: None,
             last_opened: Some(LastOpened {
                 web_url: "https://gitlab.com/x/-/merge_requests/1628".into(),
@@ -955,6 +970,8 @@ mod tests {
             default_branches: HashMap::new(),
             projects: Vec::new(),
             role: Role::Reviewer,
+            editor_name: "Zed",
+            warm: true,
             fetches: None,
             last_opened: None,
             launching: None,

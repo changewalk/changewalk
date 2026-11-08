@@ -1,5 +1,6 @@
 //! Checking the merge request's branch out and opening it in Zed.
 
+use crate::config::Ide;
 use crate::forge::{self, MergeRequest, Project, git};
 use anyhow::{Context as _, Result, bail};
 use std::{
@@ -7,11 +8,14 @@ use std::{
     process::Command,
 };
 
-/// Checks the branch out, hands the merge request to Zed as a file, and opens
-/// the diff with a suggested review order. Returns a line saying what
-/// happened, for the picker's status, since it runs while the picker owns
-/// the terminal.
-pub fn open_in_zed(merge_request: &MergeRequest, zed_app: &Path) -> Result<String> {
+/// Checks the branch out, hands the merge request to the editor as a file,
+/// and opens the diff. Returns a line saying what happened, for the picker's
+/// status, since it runs while the picker owns the terminal.
+///
+/// The git work and the hand-off file are the same for every editor; only
+/// the launch URL and whether the model key is passed differ, which [`Ide`]
+/// answers.
+pub fn open(ide: Ide, merge_request: &MergeRequest, app: &Path) -> Result<String> {
     // The list may be hours old. A parent change merging retargets this one
     // and deletes the branch it was diffed against, so ask the host for the
     // change as it is now before checking anything out.
@@ -49,20 +53,15 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: &Path) -> Result<Strin
         query.push(("base", base));
     }
     query.push(("mr", file.to_string_lossy().into_owned()));
-    let url = format!(
-        "zed://git/review?{}",
-        query
-            .iter()
-            .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
-            .collect::<Vec<_>>()
-            .join("&")
-    );
+    let url = ide.review_url(&query);
 
     let mut open = Command::new("open");
-    // A freshly launched app does not inherit the shell's environment, so
-    // pass the model key through. A running app keeps the environment it
-    // started with, and `open` warns if asked to change it, so skip it then.
-    if !zed_is_running(zed_app) {
+    // Zed runs the review itself and so wants the model key. A freshly
+    // launched app does not inherit the shell's environment, so pass it
+    // through; a running app keeps the environment it started with, and
+    // `open` warns if asked to change it, so skip it then. VS Code and
+    // Cursor are fed by the CLI and need no key.
+    if ide.runs_review_in_editor() && !editor_is_running(app, ide) {
         for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
             if let Ok(value) = std::env::var(key) {
                 open.arg("--env").arg(format!("{key}={value}"));
@@ -71,17 +70,18 @@ pub fn open_in_zed(merge_request: &MergeRequest, zed_app: &Path) -> Result<Strin
     }
     let status = open
         .arg("-a")
-        .arg(zed_app)
+        .arg(app)
         .arg(&url)
         .status()
         .context("running open")?;
     if !status.success() {
-        bail!("could not open {}", zed_app.display());
+        bail!("could not open {}", app.display());
     }
     let mut message = format!(
-        "opened {} ({}) in Zed",
+        "opened {} ({}) in {}",
         merge_request.number(),
-        merge_request.source_branch
+        merge_request.source_branch,
+        ide.name(),
     );
     if let Some(warning) = warning {
         message.push_str(" · ");
@@ -256,8 +256,15 @@ fn write_merge_request_file(merge_request: &MergeRequest) -> Result<PathBuf> {
     Ok(file)
 }
 
-fn zed_is_running(zed_app: &Path) -> bool {
-    let executable = zed_app.join("Contents/MacOS/zed");
+/// Whether the editor's app is already running, so a launch does not try to
+/// change the environment of a live process. Only Zed asks, and only Zed
+/// takes the model key, so the executable is Zed's; a new editor that runs
+/// the review itself would add its own executable name here.
+fn editor_is_running(app: &Path, ide: Ide) -> bool {
+    let executable = match ide {
+        Ide::Zed => app.join("Contents/MacOS/zed"),
+        Ide::VsCode | Ide::Cursor => return false,
+    };
     let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
     Command::new("pgrep")
         .arg("-f")

@@ -194,11 +194,7 @@ fn draw(frame: &mut Frame, step: Step, forge: usize, ide: usize) {
                 lines.extend(if app.exists() {
                     detail(&format!("found at {}", app.display()), text_width, READY)
                 } else {
-                    detail(
-                        "not found; set ZED_APP or --zed-app to its path",
-                        text_width,
-                        MISSING,
-                    )
+                    detail("not found; set --app to its path", text_width, MISSING)
                 });
                 lines.push(Line::from(""));
             }
