@@ -1,0 +1,2744 @@
+From 1dc4aea0b42740486c5c36ca91836b5f05593d21 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Thu, 15 Oct 2026 11:34:36 +0100
+Subject: [PATCH 1/4] Add a model-suggested review order and GitLab review flow
+
+---
+ Cargo.lock                                |   1 +
+ crates/editor/src/editor.rs               |   1 +
+ crates/editor/src/git.rs                  |  27 +-
+ crates/git_ui/Cargo.toml                  |   1 +
+ crates/git_ui/src/branch_diff.rs          | 197 ++++-
+ crates/git_ui/src/diff_multibuffer.rs     | 842 +++++++++++++++++++++-
+ crates/git_ui/src/git_ui.rs               |   2 +
+ crates/git_ui/src/gitlab_review.rs        | 292 ++++++++
+ crates/git_ui/src/project_diff.rs         | 258 ++++++-
+ crates/git_ui/src/review_notes_prompt.txt |  22 +
+ crates/git_ui/src/review_order.rs         | 432 +++++++++++
+ crates/git_ui/src/review_order_prompt.txt |  22 +
+ crates/zed/src/main.rs                    |  48 +-
+ crates/zed/src/zed/open_listener.rs       | 117 +++
+ 14 files changed, 2223 insertions(+), 39 deletions(-)
+ create mode 100644 crates/git_ui/src/gitlab_review.rs
+ create mode 100644 crates/git_ui/src/review_notes_prompt.txt
+ create mode 100644 crates/git_ui/src/review_order.rs
+ create mode 100644 crates/git_ui/src/review_order_prompt.txt
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 1e0942cf22..10f7631b34 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7111,6 +7111,7 @@ dependencies = [
+  "ui",
+  "ui_input",
+  "unindent",
++ "urlencoding",
+  "util",
+  "watch",
+  "workspace",
+diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
+index e112f71ba7..576f6b5a30 100644
+--- a/crates/editor/src/editor.rs
++++ b/crates/editor/src/editor.rs
+@@ -111,6 +111,7 @@ pub use element::{
+     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
+     file_status_label_color, render_breadcrumb_text,
+ };
++pub use git::ReviewCommentSnapshot;
+ pub use git::blame::{BlameRenderer, GitBlame};
+ pub use git::{
+     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
+diff --git a/crates/editor/src/git.rs b/crates/editor/src/git.rs
+index 2fd67319f2..67eccb4d40 100644
+--- a/crates/editor/src/git.rs
++++ b/crates/editor/src/git.rs
+@@ -225,6 +225,16 @@ impl StoredReviewComment {
+     }
+ }
+ 
++/// A stored review comment, with what a caller needs to post it elsewhere.
++#[derive(Clone, Debug)]
++pub struct ReviewCommentSnapshot {
++    pub id: usize,
++    /// The file path, relative to the worktree.
++    pub file_path: Arc<util::rel_path::RelPath>,
++    pub range: Range<Anchor>,
++    pub text: String,
++}
++
+ impl Editor {
+     pub fn diff_hunks_in_ranges<'a>(
+         &'a self,
+@@ -753,6 +763,21 @@ impl Editor {
+             .sum()
+     }
+ 
++    /// Every stored review comment, in the order they were added within each hunk.
++    pub fn review_comments(&self) -> Vec<ReviewCommentSnapshot> {
++        self.stored_review_comments
++            .iter()
++            .flat_map(|(key, comments)| {
++                comments.iter().map(|comment| ReviewCommentSnapshot {
++                    id: comment.id,
++                    file_path: key.file_path.clone(),
++                    range: comment.range.clone(),
++                    text: comment.comment.clone(),
++                })
++            })
++            .collect()
++    }
++
+     /// Adds a new review comment to a specific hunk.
+     pub(super) fn add_review_comment(
+         &mut self,
+@@ -1164,7 +1189,7 @@ impl Editor {
+     }
+ 
+     /// Removes a review comment by ID from any hunk.
+-    pub(super) fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
++    pub fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
+         for (_, comments) in self.stored_review_comments.iter_mut() {
+             if let Some(index) = comments.iter().position(|c| c.id == id) {
+                 comments.remove(index);
+diff --git a/crates/git_ui/Cargo.toml b/crates/git_ui/Cargo.toml
+index 4ea810d641..bcacf39057 100644
+--- a/crates/git_ui/Cargo.toml
++++ b/crates/git_ui/Cargo.toml
+@@ -36,6 +36,7 @@ fuzzy.workspace = true
+ fuzzy_nucleo.workspace = true
+ git.workspace = true
+ gpui.workspace = true
++urlencoding.workspace = true
+ itertools.workspace = true
+ language.workspace = true
+ language_model.workspace = true
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index 31cf501dd6..a3937a4234 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -2,8 +2,9 @@ use crate::{
+     branch_picker,
+     diff_multibuffer::DiffMultibuffer,
+     project_diff::{
+-        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
+-        render_send_review_to_agent_button,
++        self, ClearReviewOrder, CompareWithBranch, DeployBranchDiff, PostReviewToGitLab,
++        ProjectDiff, ReviewDiff, SuggestReviewOrder, render_post_review_to_gitlab_button,
++        render_review_order_button, render_send_review_to_agent_button,
+     },
+ };
+ use agent_settings::AgentSettings;
+@@ -68,6 +69,12 @@ impl Addon for BranchDiffAddon {
+     }
+ }
+ 
++/// What a `zed://git/review` launch asks the branch diff to do once open.
++#[derive(Clone)]
++struct ReviewLaunch {
++    merge_request_file: Option<std::path::PathBuf>,
++}
++
+ impl BranchDiff {
+     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+         workspace.register_action(|workspace, _: &DeployBranchDiff, window, cx| {
+@@ -81,6 +88,64 @@ impl BranchDiff {
+         workspace: &mut Workspace,
+         window: &mut Window,
+         cx: &mut Context<Workspace>,
++    ) {
++        Self::deploy_branch_diff_impl(workspace, None, None, window, cx);
++    }
++
++    /// Opens the branch diff and asks the model for a review order as soon as
++    /// the files have loaded. Used by the `zed://git/review` URL. A `base_ref`
++    /// replaces the default branch, for a merge request stacked on another.
++    ///
++    /// The URL often arrives before the project has scanned its repository,
++    /// so this waits for one to appear before opening the diff.
++    pub fn deploy_for_review(
++        workspace: &mut Workspace,
++        base_ref: Option<SharedString>,
++        merge_request_file: Option<std::path::PathBuf>,
++        window: &mut Window,
++        cx: &mut Context<Workspace>,
++    ) {
++        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
++        const MAX_POLLS: usize = 120;
++
++        let project = workspace.project().clone();
++        let workspace = cx.entity();
++        let workspace_weak = workspace.downgrade();
++        window
++            .spawn(cx, async move |cx| {
++                for poll in 0..MAX_POLLS {
++                    let deployed = workspace.update_in(cx, |workspace, window, cx| {
++                        if project.read(cx).active_repository(cx).is_none() {
++                            return false;
++                        }
++                        log::info!("review url: repository ready after {poll} polls");
++                        Self::deploy_branch_diff_impl(
++                            workspace,
++                            base_ref.clone(),
++                            Some(ReviewLaunch {
++                                merge_request_file: merge_request_file.clone(),
++                            }),
++                            window,
++                            cx,
++                        );
++                        true
++                    })?;
++                    if deployed {
++                        return Ok(());
++                    }
++                    cx.background_executor().timer(POLL_INTERVAL).await;
++                }
++                Err(anyhow!("No git repository was found in the project"))
++            })
++            .detach_and_notify_err(workspace_weak, window, cx);
++    }
++
++    fn deploy_branch_diff_impl(
++        workspace: &mut Workspace,
++        base_ref_override: Option<SharedString>,
++        review: Option<ReviewLaunch>,
++        window: &mut Window,
++        cx: &mut Context<Workspace>,
+     ) {
+         telemetry::event!("Git Branch Diff Opened");
+         let project = workspace.project().clone();
+@@ -95,6 +160,22 @@ impl BranchDiff {
+             return;
+         };
+ 
++        if let Some(base_ref) = base_ref_override {
++            // A stacked merge request's own base is not the shared default
++            // branch diff, so it gets a diff of its own.
++            Self::deploy_branch_diff_with_base_ref_impl(
++                workspace,
++                project,
++                intended_repo,
++                base_ref,
++                None,
++                review,
++                window,
++                cx,
++            );
++            return;
++        }
++
+         let default_branch = intended_repo.update(cx, |repo, _| repo.default_branch(true));
+         let workspace = cx.entity();
+         let workspace_weak = workspace.downgrade();
+@@ -119,12 +200,13 @@ impl BranchDiff {
+                         } else {
+                             None
+                         };
+-                    Self::deploy_branch_diff_with_base_ref(
++                    Self::deploy_branch_diff_with_base_ref_impl(
+                         workspace,
+                         project,
+                         intended_repo,
+                         base_ref,
+                         branch_diff,
++                        review,
+                         window,
+                         cx,
+                     );
+@@ -200,6 +282,28 @@ impl BranchDiff {
+         branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
+         window: &mut Window,
+         cx: &mut Context<Workspace>,
++    ) {
++        Self::deploy_branch_diff_with_base_ref_impl(
++            workspace,
++            project,
++            intended_repo,
++            base_ref,
++            branch_diff,
++            None,
++            window,
++            cx,
++        );
++    }
++
++    fn deploy_branch_diff_with_base_ref_impl(
++        workspace: &mut Workspace,
++        project: Entity<Project>,
++        intended_repo: Entity<Repository>,
++        base_ref: SharedString,
++        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
++        review: Option<ReviewLaunch>,
++        window: &mut Window,
++        cx: &mut Context<Workspace>,
+     ) {
+         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+             let item = item.read(cx);
+@@ -215,6 +319,14 @@ impl BranchDiff {
+         });
+         if let Some(existing) = existing {
+             workspace.activate_item(&existing, true, true, window, cx);
++            if let Some(review) = review {
++                existing.update(cx, |item, cx| {
++                    item.diff.update(cx, |diff, cx| {
++                        diff.load_merge_request(review.merge_request_file, cx);
++                        diff.suggest_review_order_when_loaded(window, cx)
++                    })
++                });
++            }
+             return;
+         }
+ 
+@@ -237,7 +349,21 @@ impl BranchDiff {
+                     .await?;
+                 workspace
+                     .update_in(cx, |workspace, window, cx| {
+-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
++                        workspace.add_item_to_active_pane(
++                            Box::new(this.clone()),
++                            None,
++                            true,
++                            window,
++                            cx,
++                        );
++                        if let Some(review) = review {
++                            this.update(cx, |item, cx| {
++                                item.diff.update(cx, |diff, cx| {
++                                    diff.load_merge_request(review.merge_request_file, cx);
++                                    diff.suggest_review_order_when_loaded(window, cx)
++                                })
++                            });
++                        }
+                     })
+                     .ok();
+                 anyhow::Ok(())
+@@ -431,6 +557,36 @@ impl BranchDiff {
+             .detach_and_notify_err(workspace, window, cx);
+     }
+ 
++    fn suggest_review_order(
++        &mut self,
++        _: &SuggestReviewOrder,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.suggest_review_order(window, cx));
++    }
++
++    fn clear_review_order(
++        &mut self,
++        _: &ClearReviewOrder,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.clear_review_order(window, cx));
++    }
++
++    fn post_review_to_gitlab(
++        &mut self,
++        _: &PostReviewToGitLab,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
++    }
++
+     #[cfg(any(test, feature = "test-support"))]
+     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
+         self.diff.read(cx).editor().clone()
+@@ -636,6 +792,9 @@ impl Render for BranchDiff {
+         div()
+             .size_full()
+             .on_action(cx.listener(Self::review_diff))
++            .on_action(cx.listener(Self::suggest_review_order))
++            .on_action(cx.listener(Self::clear_review_order))
++            .on_action(cx.listener(Self::post_review_to_gitlab))
+             .child(self.diff.clone())
+     }
+ }
+@@ -799,6 +958,8 @@ impl Render for BranchDiffToolbar {
+         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+ 
+         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
++        let review_order_button = show_review_button
++            .then(|| render_review_order_button(branch_diff.read(cx).diff.read(cx), &focus_handle));
+ 
+         h_flex()
+             .my_neg_1()
+@@ -895,14 +1056,28 @@ impl Render for BranchDiffToolbar {
+                         })),
+                 )
+             })
++            .when_some(review_order_button, |this, (button, action)| {
++                this.child(Divider::vertical())
++                    .child(button.on_click(cx.listener(move |this, _, window, cx| {
++                        this.dispatch_action(action.as_ref(), window, cx)
++                    })))
++            })
+             .when(review_count > 0, |this| {
+-                this.child(Divider::vertical()).child(
+-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+-                        cx.listener(|this, _, window, cx| {
+-                            this.dispatch_action(&SendReviewToAgent, window, cx)
+-                        }),
+-                    ),
+-                )
++                let posting = branch_diff.read(cx).diff.read(cx).is_posting_review();
++                this.child(Divider::vertical())
++                    .child(
++                        render_send_review_to_agent_button(review_count, &focus_handle).on_click(
++                            cx.listener(|this, _, window, cx| {
++                                this.dispatch_action(&SendReviewToAgent, window, cx)
++                            }),
++                        ),
++                    )
++                    .child(
++                        render_post_review_to_gitlab_button(review_count, posting, &focus_handle)
++                            .on_click(cx.listener(|this, _, window, cx| {
++                                this.dispatch_action(&PostReviewToGitLab, window, cx)
++                            })),
++                    )
+             })
+     }
+ }
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index 6c9aeb35ca..9620c48828 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -2,23 +2,37 @@ use crate::{
+     conflict_view,
+     git_panel::{GitPanel, GitStatusEntry},
+     git_panel_settings::GitPanelSettings,
++    gitlab_review::{self, GitLabComment},
++    review_order::{
++        MAX_EXCERPT_BYTES_PER_FILE, ReviewNotes, ReviewOrder, ReviewOrderFile, build_notes_prompt,
++        build_order_prompt, parse_review_notes, parse_review_order,
++    },
+ };
+-use anyhow::Result;
++use agent_settings::AgentSettings;
++use anyhow::{Context as _, Result};
+ use buffer_diff::BufferDiff;
+ use collections::{HashMap, HashSet};
+ use editor::{
+-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
+-    multibuffer_context_lines, scroll::Autoscroll,
++    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
++    actions::GoToHunk,
++    display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
++    multibuffer_context_lines,
++    scroll::Autoscroll,
+ };
+ use futures::{FutureExt as _, StreamExt as _, stream};
+ use futures_lite::future::yield_now;
+ use git::{repository::RepoPath, status::FileStatus};
+ use gpui::{
+-    App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
+-    SharedString, Subscription, Task, WeakEntity,
++    AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle,
++    Focusable, FontWeight, Render, SharedString, Subscription, Task, WeakEntity,
++};
++use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point};
++use language_model::{
++    CompletionIntent, LanguageModel, LanguageModelProvider, LanguageModelRegistry,
++    LanguageModelRequest, LanguageModelRequestMessage, Role,
+ };
+-use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
+-use multi_buffer::{MultiBuffer, PathKey};
++use markdown::{Markdown, MarkdownElement};
++use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+ use project::{
+     ConflictSet, Project, ProjectPath,
+     git_store::{
+@@ -27,13 +41,14 @@ use project::{
+     },
+ };
+ use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
+-use std::{collections::BTreeMap, sync::Arc};
++use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+ use theme::ActiveTheme;
+-use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
++use ui::{CommonAnimationExt as _, KeyBinding, Tooltip, prelude::*};
+ use util::{ResultExt as _, rel_path::RelPath};
+ use workspace::{
+-    CloseActiveItem, ItemNavHistory, Workspace,
++    CloseActiveItem, ItemNavHistory, Toast, Workspace,
+     item::{Item, SaveOptions},
++    notifications::NotificationId,
+ };
+ use ztracing::instrument;
+ 
+@@ -59,10 +74,43 @@ pub struct DiffMultibuffer {
+     pending_scroll: Option<PathKey>,
+     review_comment_count: usize,
+     empty_label: SharedString,
++    review_order: Option<Arc<ReviewOrder>>,
++    review_order_state: ReviewOrderState,
++    review_order_blocks: Vec<CustomBlockId>,
++    _review_order_task: Option<Task<()>>,
++    _review_notes_task: Option<Task<()>>,
++    /// Notes that arrived before the order they belong to.
++    pending_notes: Option<ReviewNotes>,
++    _review_order_wait_task: Option<Task<()>>,
++    merge_request: Option<MergeRequestHeader>,
++    _merge_request_task: Option<Task<()>>,
++    posting_review: bool,
++    _post_review_task: Option<Task<()>>,
+     _task: Task<Result<()>>,
+     _subscription: Subscription,
+ }
+ 
++/// The merge request shown above the diff while reviewing.
++struct MergeRequestHeader {
++    iid: u64,
++    title: SharedString,
++    author: SharedString,
++    web_url: SharedString,
++    description: Option<Entity<Markdown>>,
++    expanded: bool,
++}
++
++/// Where a request for a review order is up to.
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) enum ReviewOrderState {
++    Idle,
++    /// Waiting for the files to load and a model to become available before
++    /// the request can be sent.
++    WaitingForModel,
++    Suggesting,
++    Failed(SharedString),
++}
++
+ impl DiffMultibuffer {
+     pub(crate) fn new(
+         branch_diff: Entity<diff_buffer_list::DiffBufferList>,
+@@ -171,6 +219,17 @@ impl DiffMultibuffer {
+             pending_scroll: None,
+             review_comment_count: 0,
+             empty_label: empty_label.into(),
++            review_order: None,
++            review_order_state: ReviewOrderState::Idle,
++            review_order_blocks: Vec::new(),
++            _review_order_task: None,
++            _review_notes_task: None,
++            pending_notes: None,
++            _review_order_wait_task: None,
++            merge_request: None,
++            _merge_request_task: None,
++            posting_review: false,
++            _post_review_task: None,
+             _task: task,
+             _subscription: Subscription::join(
+                 branch_diff_subscription,
+@@ -219,7 +278,13 @@ impl DiffMultibuffer {
+             return;
+         };
+         let repo = git_repo.read(cx);
+-        let path_key = project_diff_path_key(repo, &entry.repo_path, entry.status, cx);
++        let path_key = project_diff_path_key(
++            repo,
++            &entry.repo_path,
++            entry.status,
++            self.review_order.as_deref(),
++            cx,
++        );
+ 
+         self.move_to_path(path_key, window, cx)
+     }
+@@ -244,7 +309,13 @@ impl DiffMultibuffer {
+             .status_for_path(&repo_path)
+             .map(|entry| entry.status)
+             .unwrap_or(FileStatus::Untracked);
+-        let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
++        let path_key = project_diff_path_key(
++            &git_repo.read(cx),
++            &repo_path,
++            status,
++            self.review_order.as_deref(),
++            cx,
++        );
+         self.move_to_path(path_key, window, cx)
+     }
+ 
+@@ -299,6 +370,664 @@ impl DiffMultibuffer {
+         self.review_comment_count
+     }
+ 
++    pub(crate) fn review_order(&self) -> Option<&Arc<ReviewOrder>> {
++        self.review_order.as_ref()
++    }
++
++    pub(crate) fn review_order_state(&self) -> &ReviewOrderState {
++        &self.review_order_state
++    }
++
++    /// Sorts the excerpts by `order`, or back to the git panel's order for `None`.
++    pub(crate) fn set_review_order(
++        &mut self,
++        order: Option<Arc<ReviewOrder>>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self._review_order_task.take();
++        self.review_order_state = ReviewOrderState::Idle;
++        let order = match (order, self.pending_notes.take()) {
++            (Some(order), Some(notes)) => Some(Arc::new(order.with_notes(notes))),
++            (order, _) => order,
++        };
++        if order.is_none() {
++            self._review_notes_task.take();
++        }
++        if self.review_order == order {
++            cx.notify();
++            return;
++        }
++        self.review_order = order;
++        self.pending_scroll.take();
++        self._task = window.spawn(cx, {
++            let this = cx.weak_entity();
++            async |cx| Self::refresh(this, cx).await
++        });
++        cx.notify();
++    }
++
++    pub(crate) fn clear_review_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        self.set_review_order(None, window, cx);
++    }
++
++    /// Shows the open merge request for the current branch above the diff.
++    /// Reads it from `file` when the launcher already fetched it, else asks
++    /// GitLab. No merge request is not an error.
++    pub(crate) fn load_merge_request(
++        &mut self,
++        file: Option<std::path::PathBuf>,
++        cx: &mut Context<Self>,
++    ) {
++        if self.merge_request.is_some() || self._merge_request_task.is_some() {
++            return;
++        }
++        let Some(repo) = self.branch_diff.read(cx).repo().cloned() else {
++            return;
++        };
++        let (work_dir, branch) = {
++            let repo = repo.read(cx);
++            (
++                repo.work_directory_abs_path.to_path_buf(),
++                repo.branch.as_ref().map(|branch| branch.name().to_string()),
++            )
++        };
++        let Some(branch) = branch else {
++            return;
++        };
++        let fetch = cx.background_spawn(async move {
++            match file {
++                Some(file) => gitlab_review::merge_request_from_file(&file),
++                None => gitlab_review::merge_request_for_branch(work_dir, branch).await,
++            }
++        });
++        self._merge_request_task = Some(cx.spawn(async move |this, cx| {
++            let merge_request = match fetch.await {
++                Ok(merge_request) => merge_request,
++                Err(error) => {
++                    log::warn!("no merge request to show above the diff: {error:#}");
++                    return;
++                }
++            };
++            this.update(cx, |this, cx| {
++                let description = merge_request
++                    .description
++                    .filter(|text| !text.trim().is_empty())
++                    .map(|text| cx.new(|cx| Markdown::new(text.into(), None, None, cx)));
++                this.merge_request = Some(MergeRequestHeader {
++                    iid: merge_request.iid,
++                    title: merge_request.title.into(),
++                    author: merge_request
++                        .author
++                        .map(|author| author.name)
++                        .unwrap_or_default()
++                        .into(),
++                    web_url: merge_request.web_url.into(),
++                    description,
++                    expanded: true,
++                });
++                cx.notify();
++            })
++            .ok();
++        }));
++    }
++
++    fn render_merge_request_header(
++        &self,
++        window: &Window,
++        cx: &mut Context<Self>,
++    ) -> Option<AnyElement> {
++        let header = self.merge_request.as_ref()?;
++        let web_url = header.web_url.clone();
++        let colors = cx.theme().colors();
++        let title_row = h_flex()
++            .w_full()
++            .gap_2()
++            .px_2()
++            .py_1()
++            .child(
++                IconButton::new(
++                    "merge-request-toggle",
++                    if header.expanded {
++                        IconName::ChevronDown
++                    } else {
++                        IconName::ChevronRight
++                    },
++                )
++                .icon_size(IconSize::Small)
++                .on_click(cx.listener(|this, _, _, cx| {
++                    if let Some(header) = this.merge_request.as_mut() {
++                        header.expanded = !header.expanded;
++                        cx.notify();
++                    }
++                })),
++            )
++            .child(Label::new(header.title.clone()).weight(FontWeight::SEMIBOLD))
++            .child(
++                Label::new(format!("!{} · {}", header.iid, header.author))
++                    .size(LabelSize::Small)
++                    .color(Color::Muted),
++            )
++            .child(div().flex_1())
++            .child(
++                IconButton::new("merge-request-open", IconName::ArrowUpRight)
++                    .icon_size(IconSize::Small)
++                    .tooltip(Tooltip::text("Open the merge request in the browser"))
++                    .on_click(move |_, _, cx| cx.open_url(&web_url)),
++            );
++        let description = header
++            .expanded
++            .then(|| header.description.clone())
++            .flatten()
++            .map(|markdown| {
++                div()
++                    .id("merge-request-description")
++                    .w_full()
++                    .max_h(rems(18.))
++                    .overflow_y_scroll()
++                    .px_3()
++                    .pb_2()
++                    .text_sm()
++                    .child(MarkdownElement::new(
++                        markdown,
++                        editor::hover_markdown_style(window, cx),
++                    ))
++            });
++        Some(
++            v_flex()
++                .w_full()
++                .bg(colors.panel_background)
++                .border_b_1()
++                .border_color(colors.border)
++                .child(title_row)
++                .children(description)
++                .into_any_element(),
++        )
++    }
++
++    /// Whether the file list or the file contents are still being loaded.
++    fn is_loading(&self, cx: &App) -> bool {
++        self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready()
++    }
++
++    /// Asks for a review order once every file has loaded and a model is
++    /// available, which can take a moment right after the app starts. Keeps an
++    /// order that is already set.
++    pub(crate) fn suggest_review_order_when_loaded(
++        &mut self,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
++        const MAX_POLLS: usize = 60;
++
++        if self.review_order.is_some()
++            || matches!(
++                self.review_order_state,
++                ReviewOrderState::Suggesting | ReviewOrderState::WaitingForModel
++            )
++        {
++            return;
++        }
++        self.review_order_state = ReviewOrderState::WaitingForModel;
++        cx.notify();
++        // Providers normally load their keys when the agent panel starts, which
++        // does not happen when the panel is hidden, so load them here.
++        let registry = LanguageModelRegistry::global(cx);
++        let authentications: Vec<_> = registry
++            .read(cx)
++            .visible_providers()
++            .into_iter()
++            .map(|provider| provider.authenticate(cx))
++            .collect();
++        self._review_order_wait_task = Some(cx.spawn_in(window, async move |this, cx| {
++            for authentication in authentications {
++                authentication.await.ok();
++            }
++            cx.update(|_, cx| {
++                registry.update(cx, |registry, cx| registry.refresh_fallback_model(cx))
++            })
++            .ok();
++            // The files arrive in batches, so a request sent at the first one
++            // would order a fraction of the diff. Wait until loading has
++            // finished and the file count has held still for one poll.
++            let mut settled_count = None;
++            for _ in 0..MAX_POLLS {
++                let ready = this.update(cx, |this, cx| {
++                    let count = this.buffer_subscriptions.len();
++                    let loaded = count > 0 && !this.is_loading(cx);
++                    let settled = loaded && settled_count == Some(count);
++                    settled_count = loaded.then_some(count);
++                    settled
++                        && LanguageModelRegistry::read_global(cx)
++                            .commit_message_model(cx)
++                            .is_some()
++                });
++                match ready {
++                    Ok(true) => break,
++                    Ok(false) => cx.background_executor().timer(POLL_INTERVAL).await,
++                    Err(_) => return,
++                }
++            }
++            // If still not ready, this reports why through the usual error path.
++            this.update_in(cx, |this, window, cx| {
++                this.review_order_state = ReviewOrderState::Idle;
++                this.suggest_review_order(window, cx)
++            })
++            .ok();
++        }));
++    }
++
++    /// Asks a model for a review order and applies it, then asks for guiding
++    /// notes with a second, larger request so the order lands first.
++    pub(crate) fn suggest_review_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if self.review_order_state == ReviewOrderState::Suggesting
++            || !AgentSettings::get_global(cx).enabled(cx)
++        {
++            return;
++        }
++        let registry = LanguageModelRegistry::read_global(cx);
++        // The order only needs a taste of each file, so a fast model does.
++        let Some(order_model) = registry
++            .default_fast_model(cx)
++            .or_else(|| registry.commit_message_model(cx))
++        else {
++            self.fail_review_order(
++                "no language model is available. Add an API key in the agent panel's settings, \
++                 or sign in, or set `agent.default_model` in your settings"
++                    .into(),
++                cx,
++            );
++            return;
++        };
++        let notes_model = registry
++            .commit_message_model(cx)
++            .unwrap_or_else(|| order_model.clone());
++        let (order_provider, notes_provider) = match (
++            registry.provider_for_model(&order_model),
++            registry.provider_for_model(&notes_model),
++        ) {
++            (Ok(order_provider), Ok(notes_provider)) => (order_provider, notes_provider),
++            (Err(error), _) | (_, Err(error)) => {
++                self.fail_review_order(error.to_string().into(), cx);
++                return;
++            }
++        };
++        let files = self.review_order_files(cx);
++        if files.is_empty() {
++            return;
++        }
++        let known_paths: Vec<RepoPath> = files.iter().map(|file| file.path.clone()).collect();
++        let order_request = text_request(build_order_prompt(&files, None), &order_model, cx);
++        let notes_request = text_request(build_notes_prompt(&files, None), &notes_model, cx);
++
++        self.pending_notes.take();
++        self.review_order_state = ReviewOrderState::Suggesting;
++        cx.notify();
++        self._review_order_task = Some(cx.spawn_in(window, {
++            let known_paths = known_paths.clone();
++            async move |this, cx| {
++                let result = complete_text(order_provider, order_model, order_request, cx)
++                    .await
++                    .and_then(|text| parse_review_order(&text, &known_paths));
++                this.update_in(cx, |this, window, cx| match result {
++                    Ok(order) => this.set_review_order(Some(Arc::new(order)), window, cx),
++                    Err(error) => this.fail_review_order(format!("{error:#}").into(), cx),
++                })
++                .ok();
++            }
++        }));
++        self._review_notes_task = Some(cx.spawn_in(window, async move |this, cx| {
++            let result = complete_text(notes_provider, notes_model, notes_request, cx)
++                .await
++                .and_then(|text| parse_review_notes(&text, &known_paths));
++            this.update(cx, |this, cx| match result {
++                Ok(notes) => this.apply_review_notes(notes, cx),
++                Err(error) => {
++                    log::warn!("review notes failed: {error:#}");
++                    this.show_workspace_error(
++                        format!("The review order has no notes: {error:#}"),
++                        cx,
++                    );
++                }
++            })
++            .ok();
++        }));
++    }
++
++    /// Puts `notes` on the current order, or keeps them for the order that
++    /// is still on its way.
++    fn apply_review_notes(&mut self, notes: ReviewNotes, cx: &mut Context<Self>) {
++        match self.review_order.clone() {
++            Some(order) => {
++                self.review_order = Some(Arc::new(order.with_notes(notes)));
++                self.update_review_order_blocks(cx);
++                cx.notify();
++            }
++            None if self.review_order_state == ReviewOrderState::Suggesting => {
++                self.pending_notes = Some(notes);
++            }
++            None => {}
++        }
++    }
++
++    fn fail_review_order(&mut self, message: SharedString, cx: &mut Context<Self>) {
++        self._review_order_task.take();
++        self.review_order_state = ReviewOrderState::Failed(message.clone());
++        self.show_workspace_error(format!("Failed to suggest a review order: {message}"), cx);
++        cx.notify();
++    }
++
++    /// Shows an error on the workspace after the current update, since the
++    /// caller may itself be running inside a workspace update.
++    fn show_workspace_error(&self, message: String, cx: &mut Context<Self>) {
++        let workspace = self.workspace.clone();
++        cx.defer(move |cx| {
++            if let Some(workspace) = workspace.upgrade() {
++                workspace.update(cx, |workspace, cx| workspace.show_error(message, cx));
++            }
++        });
++    }
++
++    #[cfg(any(test, feature = "test-support"))]
++    pub(crate) fn review_order_block_count(&self) -> usize {
++        self.review_order_blocks.len()
++    }
++
++    pub(crate) fn is_posting_review(&self) -> bool {
++        self.posting_review
++    }
++
++    /// Posts the stored review comments as inline discussions on the open
++    /// merge request of the current branch, then drops the ones that posted.
++    pub(crate) fn post_review_to_gitlab(&mut self, cx: &mut Context<Self>) {
++        if self.posting_review {
++            return;
++        }
++        let Some(repo) = self.branch_diff.read(cx).repo().cloned() else {
++            return;
++        };
++        let (work_dir, branch) = {
++            let repo = repo.read(cx);
++            (
++                repo.work_directory_abs_path.to_path_buf(),
++                repo.branch.as_ref().map(|branch| branch.name().to_string()),
++            )
++        };
++        let Some(branch) = branch else {
++            self.fail_post_review("the repository has no current branch".into(), cx);
++            return;
++        };
++        let comments = self.gitlab_comments(cx);
++        if comments.is_empty() {
++            return;
++        }
++
++        self.posting_review = true;
++        cx.notify();
++        let outcome = cx.background_spawn(gitlab_review::post_review(work_dir, branch, comments));
++        self._post_review_task = Some(cx.spawn(async move |this, cx| {
++            let outcome = outcome.await;
++            this.update(cx, |this, cx| {
++                this.posting_review = false;
++                match outcome {
++                    Ok(outcome) => {
++                        this.editor
++                            .read(cx)
++                            .rhs_editor()
++                            .clone()
++                            .update(cx, |editor, cx| {
++                                for id in &outcome.posted_ids {
++                                    editor.remove_review_comment(*id, cx);
++                                }
++                            });
++                        match outcome.error {
++                            Some(error) => this.fail_post_review(
++                                format!(
++                                    "{} of the comments posted, then: {error:#}",
++                                    outcome.posted_ids.len()
++                                )
++                                .into(),
++                                cx,
++                            ),
++                            None => this.show_posted_review_toast(
++                                outcome.posted_ids.len(),
++                                outcome.merge_request.iid,
++                                outcome.merge_request.web_url,
++                                cx,
++                            ),
++                        }
++                    }
++                    Err(error) => this.fail_post_review(format!("{error:#}").into(), cx),
++                }
++                cx.notify();
++            })
++            .ok();
++        }));
++    }
++
++    /// The stored review comments, each resolved to its file and the last
++    /// line of its range in the new version of the file.
++    fn gitlab_comments(&self, cx: &App) -> Vec<GitLabComment> {
++        let snapshot = self.multibuffer.read(cx).snapshot(cx);
++        let paths_by_buffer: HashMap<BufferId, &RepoPath> = self
++            .buffer_subscriptions
++            .iter()
++            .map(|(path, subscription)| (subscription.display_buffer.read(cx).remote_id(), path))
++            .collect();
++        self.editor
++            .read(cx)
++            .rhs_editor()
++            .read(cx)
++            .review_comments()
++            .into_iter()
++            .filter_map(|comment| {
++                let start = comment.range.start.to_point(&snapshot);
++                let mut end = comment.range.end.to_point(&snapshot);
++                // A range that ends at the start of a line does not include that line.
++                if end.row > start.row && end.column == 0 {
++                    end.row -= 1;
++                }
++                let (buffer, point) = snapshot.point_to_buffer_point(end)?;
++                let path = paths_by_buffer.get(&buffer.remote_id())?;
++                Some(GitLabComment {
++                    id: comment.id,
++                    path: path.as_unix_str().to_string(),
++                    line: point.row + 1,
++                    body: comment.text,
++                })
++            })
++            .collect()
++    }
++
++    fn fail_post_review(&mut self, message: SharedString, cx: &mut Context<Self>) {
++        self._post_review_task.take();
++        self.posting_review = false;
++        self.show_workspace_error(
++            format!("Failed to post the review to GitLab: {message}"),
++            cx,
++        );
++        cx.notify();
++    }
++
++    fn show_posted_review_toast(
++        &self,
++        posted: usize,
++        merge_request_iid: u64,
++        web_url: String,
++        cx: &mut Context<Self>,
++    ) {
++        let Some(workspace) = self.workspace.upgrade() else {
++            return;
++        };
++        workspace.update(cx, |workspace, cx| {
++            struct PostedReviewToast;
++            let noun = if posted == 1 { "comment" } else { "comments" };
++            workspace.show_toast(
++                Toast::new(
++                    NotificationId::unique::<PostedReviewToast>(),
++                    format!("Posted {posted} {noun} to !{merge_request_iid}"),
++                )
++                .on_click("Open", move |_, cx| cx.open_url(&web_url))
++                .autohide(),
++                cx,
++            );
++        });
++    }
++
++    /// Each loaded file with its status, line counts, and first changed lines,
++    /// in path order so the prompt is stable between runs.
++    fn review_order_files(&self, cx: &App) -> Vec<ReviewOrderFile> {
++        let branch_diff = self.branch_diff.read(cx);
++        let mut files: Vec<ReviewOrderFile> = self
++            .buffer_subscriptions
++            .iter()
++            .map(|(repo_path, subscription)| {
++                let buffer = subscription.display_buffer.read(cx).snapshot();
++                let diff = subscription._diff.read(cx).snapshot(cx);
++                let base_text = diff.base_text();
++                let mut added_lines = 0;
++                let mut removed_lines = 0;
++                let mut excerpt = String::new();
++                for hunk in diff.hunks(&buffer) {
++                    let removed: String = base_text
++                        .text_for_range(hunk.diff_base_byte_range.clone())
++                        .collect();
++                    let added: String = buffer.text_for_range(hunk.buffer_range.clone()).collect();
++                    removed_lines += removed.lines().count();
++                    added_lines += added.lines().count();
++                    if excerpt.len() >= MAX_EXCERPT_BYTES_PER_FILE {
++                        continue;
++                    }
++                    for line in removed.lines() {
++                        writeln!(excerpt, "-     |{line}").ok();
++                    }
++                    // Added lines carry their number in the new file, so the
++                    // model's notes can name a line the editor can show.
++                    for (offset, line) in added.lines().enumerate() {
++                        let number = hunk.range.start.row as usize + offset + 1;
++                        writeln!(excerpt, "+{number:>5} |{line}").ok();
++                    }
++                }
++                ReviewOrderFile {
++                    path: repo_path.clone(),
++                    status: branch_diff
++                        .status_for_path(repo_path, cx)
++                        .unwrap_or(FileStatus::Untracked),
++                    added_lines,
++                    removed_lines,
++                    excerpt,
++                }
++            })
++            .collect();
++        files.sort_by(|a, b| a.path.cmp(&b.path));
++        files
++    }
++
++    /// Puts a one-line header with the file's place and reason above the first
++    /// excerpt of each file the review order lists, and each of the file's
++    /// guiding notes above the line it describes.
++    fn update_review_order_blocks(&mut self, cx: &mut Context<Self>) {
++        let old_blocks: HashSet<CustomBlockId> = self.review_order_blocks.drain(..).collect();
++        let mut blocks = Vec::new();
++        if let Some(order) = self.review_order.clone()
++            && let Some(repo) = self.branch_diff.read(cx).repo().cloned()
++        {
++            let total = order.len();
++            let snapshot = self.multibuffer.read(cx).snapshot(cx);
++            for (index, entry) in order.entries().iter().enumerate() {
++                if let Some(subscription) = self.buffer_subscriptions.get(&entry.path) {
++                    let buffer = subscription.display_buffer.read(cx).snapshot();
++                    for note in &entry.notes {
++                        // A note past the end of the file lands on its last line.
++                        let row = note.line.saturating_sub(1).min(buffer.max_point().row);
++                        let text_anchor = buffer.anchor_before(Point::new(row, 0));
++                        let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
++                            continue;
++                        };
++                        let text = note.text.clone();
++                        blocks.push(BlockProperties {
++                            placement: BlockPlacement::Above(anchor),
++                            height: Some(1),
++                            style: BlockStyle::Flex,
++                            render: Arc::new(move |cx| {
++                                h_flex()
++                                    .id(cx.block_id)
++                                    .h(cx.line_height)
++                                    .w_full()
++                                    .pl(cx.margins.gutter.width)
++                                    .gap_1p5()
++                                    .overflow_hidden()
++                                    .bg(cx.theme().colors().editor_background)
++                                    .child(
++                                        Icon::new(IconName::Sparkle)
++                                            .size(IconSize::Small)
++                                            .color(Color::Accent),
++                                    )
++                                    .child(
++                                        Label::new(text.clone())
++                                            .size(LabelSize::Small)
++                                            .color(Color::Muted)
++                                            .italic(),
++                                    )
++                                    .into_any_element()
++                            }),
++                            priority: 0,
++                        });
++                    }
++                }
++                let status = self
++                    .branch_diff
++                    .read(cx)
++                    .status_for_path(&entry.path, cx)
++                    .unwrap_or(FileStatus::Untracked);
++                let path_key =
++                    project_diff_path_key(repo.read(cx), &entry.path, status, Some(&*order), cx);
++                let Some(anchor) = self.multibuffer.read(cx).location_for_path(&path_key, cx)
++                else {
++                    continue;
++                };
++                let reason = entry.reason.clone();
++                blocks.push(BlockProperties {
++                    placement: BlockPlacement::Above(anchor),
++                    height: Some(1),
++                    style: BlockStyle::Sticky,
++                    render: Arc::new(move |cx| {
++                        h_flex()
++                            .id(cx.block_id)
++                            .h(cx.line_height)
++                            .w_full()
++                            .ml(cx.margins.gutter.width)
++                            .gap_2()
++                            .bg(cx.theme().colors().editor_background)
++                            .child(
++                                Label::new(format!("{} of {}", index + 1, total))
++                                    .size(LabelSize::Small)
++                                    .color(Color::Accent),
++                            )
++                            .child(
++                                Label::new(reason.clone())
++                                    .size(LabelSize::Small)
++                                    .color(Color::Muted),
++                            )
++                            .into_any_element()
++                    }),
++                    priority: 0,
++                });
++            }
++        }
++        self.editor.update(cx, |editor, cx| {
++            editor.rhs_editor().update(cx, |editor, cx| {
++                if !old_blocks.is_empty() {
++                    editor.remove_blocks(old_blocks, None, cx);
++                }
++                if !blocks.is_empty() {
++                    self.review_order_blocks = editor.insert_blocks(blocks, None, cx);
++                }
++            })
++        });
++    }
++
+     /// Returns a reference to the splittable editor.
+     pub(crate) fn editor(&self) -> &Entity<SplittableEditor> {
+         &self.editor
+@@ -639,6 +1368,7 @@ impl DiffMultibuffer {
+ 
+             let mut entries = BTreeMap::new();
+             let mut live_repo_paths = HashSet::default();
++            let review_order = this.review_order.clone();
+             if let Some(repo) = repo {
+                 let repo = repo.read(cx);
+                 for diff_buffer in buffers_to_load {
+@@ -647,6 +1377,7 @@ impl DiffMultibuffer {
+                         &repo,
+                         &diff_buffer.repo_path,
+                         diff_buffer.file_status,
++                        review_order.as_deref(),
+                         cx,
+                     );
+                     previous_paths.remove(&path_key);
+@@ -729,6 +1460,7 @@ impl DiffMultibuffer {
+                 });
+             }
+             this.pending_scroll.take();
++            this.update_review_order_blocks(cx);
+             cx.notify();
+         })?;
+ 
+@@ -901,10 +1633,13 @@ impl Focusable for DiffMultibuffer {
+ }
+ 
+ impl Render for DiffMultibuffer {
+-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         let is_empty = self.multibuffer.read(cx).is_empty();
+-        let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
++        let is_loading = self.is_loading(cx);
+         let empty_label = self.empty_label.clone();
++        let merge_request_header = (!is_empty)
++            .then(|| self.render_merge_request_header(window, cx))
++            .flatten();
+ 
+         div()
+             .track_focus(&self.focus_handle)
+@@ -966,13 +1701,72 @@ impl Render for DiffMultibuffer {
+                         ),
+                 )
+             })
+-            .when(!is_empty, |el| el.child(self.editor.clone()))
++            .when(!is_empty, |el| {
++                el.child(
++                    v_flex()
++                        .size_full()
++                        .children(merge_request_header)
++                        .child(div().flex_1().min_h_0().w_full().child(self.editor.clone())),
++                )
++            })
+     }
+ }
+ 
++/// A single user message asking the model for `prompt`.
++fn text_request(prompt: String, model: &LanguageModel, cx: &App) -> LanguageModelRequest {
++    LanguageModelRequest {
++        thread_id: None,
++        prompt_cache_key: None,
++        prompt_id: None,
++        intent: Some(CompletionIntent::UserPrompt),
++        messages: vec![LanguageModelRequestMessage {
++            role: Role::User,
++            content: vec![prompt.into()],
++            cache: false,
++            reasoning_details: None,
++        }],
++        tools: Vec::new(),
++        tool_choice: None,
++        stop: Vec::new(),
++        temperature: AgentSettings::temperature_for_model(model, cx),
++        thinking_allowed: false,
++        thinking_effort: None,
++        speed: None,
++        compact_at_tokens: None,
++        max_output_tokens: None,
++    }
++}
++
++/// Sends `request` to `model` and collects the whole reply as text.
++async fn complete_text(
++    provider: Arc<dyn LanguageModelProvider>,
++    model: LanguageModel,
++    request: LanguageModelRequest,
++    cx: &mut AsyncWindowContext,
++) -> Result<String> {
++    if let Some(task) =
++        cx.update(|_, cx| (!provider.is_authenticated(cx)).then(|| provider.authenticate(cx)))?
++    {
++        task.await.log_err();
++    }
++    let mut stream = provider
++        .stream_completion_text(&model, request, cx)
++        .await
++        .context("the model request failed")?;
++    let mut text = String::new();
++    while let Some(chunk) = stream.stream.next().await {
++        text.push_str(&chunk.context("the model reply stopped early")?);
++    }
++    Ok(text)
++}
++
+ const CONFLICT_SORT_PREFIX: u64 = 1;
+ const TRACKED_SORT_PREFIX: u64 = 2;
+ const NEW_SORT_PREFIX: u64 = 3;
++/// A file the review order lists sorts at this prefix plus its place in the order.
++const REVIEW_ORDER_SORT_PREFIX: u64 = 1 << 32;
++/// A file the review order leaves out sorts after every listed file.
++const REVIEW_ORDER_UNLISTED_SORT_PREFIX: u64 = 1 << 33;
+ 
+ /// Computes a stable [`PathKey`] for a buffer in the project diff.
+ ///
+@@ -987,13 +1781,31 @@ const NEW_SORT_PREFIX: u64 = 3;
+ /// ordering reproduces the git panel's order. The path here is only ever used
+ /// for sorting and multibuffer identity; the path shown in the UI comes from the
+ /// buffer's own `File`.
++///
++/// When a [`ReviewOrder`] is set, a file's place in that order replaces the
++/// status grouping, and files the order leaves out keep the git panel's order
++/// after the listed ones. The order is fixed for the life of the view, so the
++/// key stays intrinsic to the file; changing the order rebuilds every excerpt.
+ pub(crate) fn project_diff_path_key(
+     repo: &Repository,
+     repo_path: &RepoPath,
+     status: FileStatus,
++    review_order: Option<&ReviewOrder>,
+     cx: &App,
+ ) -> PathKey {
+     let settings = GitPanelSettings::get_global(cx);
++    if let Some(order) = review_order {
++        return match order.position(repo_path) {
++            Some(position) => PathKey::with_sort_prefix(
++                REVIEW_ORDER_SORT_PREFIX + position as u64,
++                repo_path.into_arc(),
++            ),
++            None => PathKey::with_sort_prefix(
++                REVIEW_ORDER_UNLISTED_SORT_PREFIX,
++                project_diff_sort_path(repo_path, settings.tree_view, settings.sort_by),
++            ),
++        };
++    }
+     let sort_prefix = if settings.group_by != GitPanelGroupBy::Status {
+         TRACKED_SORT_PREFIX
+     } else if repo.had_conflict_on_last_merge_head_change(repo_path) {
+diff --git a/crates/git_ui/src/git_ui.rs b/crates/git_ui/src/git_ui.rs
+index 24d2a50285..298fb9066f 100644
+--- a/crates/git_ui/src/git_ui.rs
++++ b/crates/git_ui/src/git_ui.rs
+@@ -49,11 +49,13 @@ pub mod git_panel;
+ mod git_panel_settings;
+ pub mod git_picker;
+ mod git_runtime_diagnostics;
++mod gitlab_review;
+ pub mod multi_diff_view;
+ pub mod picker_prompt;
+ pub mod project_diff;
+ pub(crate) mod remote_output;
+ pub mod repository_selector;
++mod review_order;
+ pub mod solo_diff_view;
+ pub mod staged_diff;
+ pub mod stash_picker;
+diff --git a/crates/git_ui/src/gitlab_review.rs b/crates/git_ui/src/gitlab_review.rs
+new file mode 100644
+index 0000000000..c757a949b9
+--- /dev/null
++++ b/crates/git_ui/src/gitlab_review.rs
+@@ -0,0 +1,292 @@
++//! Posts the review comments of a diff view to the open merge request of the
++//! current branch.
++//!
++//! The requests go through the `glab` CLI, which already holds the user's
++//! GitLab login and knows which project the repository belongs to.
++
++use anyhow::{Context as _, Result, anyhow, bail};
++use futures::{AsyncWriteExt as _, StreamExt as _, stream};
++use serde::Deserialize;
++use serde_json::json;
++use std::path::{Path, PathBuf};
++use util::command::{Stdio, new_command};
++
++/// A review comment resolved to a path and a line in the new version of a file.
++#[derive(Clone, Debug, PartialEq)]
++pub struct GitLabComment {
++    /// The editor's id for the comment, so it can be removed once posted.
++    pub id: usize,
++    /// The path relative to the repository root, with forward slashes.
++    pub path: String,
++    /// One-based line in the new version of the file.
++    pub line: u32,
++    pub body: String,
++}
++
++/// The commits a merge request's diff is between.
++#[derive(Clone, Debug, Deserialize, PartialEq)]
++pub struct DiffRefs {
++    pub base_sha: String,
++    pub head_sha: String,
++    pub start_sha: String,
++}
++
++#[derive(Clone, Debug, Deserialize, PartialEq)]
++pub struct MergeRequest {
++    pub iid: u64,
++    pub web_url: String,
++    #[serde(default)]
++    pub title: String,
++    #[serde(default)]
++    pub description: Option<String>,
++    #[serde(default)]
++    pub author: Option<Author>,
++    #[serde(default)]
++    pub diff_refs: Option<DiffRefs>,
++}
++
++#[derive(Clone, Debug, Deserialize, PartialEq)]
++pub struct Author {
++    pub name: String,
++}
++
++/// The open merge request whose source branch is `branch`, with its
++/// description, for showing above the diff.
++pub async fn merge_request_for_branch(work_dir: PathBuf, branch: String) -> Result<MergeRequest> {
++    find_merge_request(&work_dir, &branch).await
++}
++
++/// A merge request the launcher already fetched and wrote as JSON, which
++/// saves two round trips to GitLab at open time.
++pub fn merge_request_from_file(file: &Path) -> Result<MergeRequest> {
++    let text = std::fs::read_to_string(file)
++        .with_context(|| format!("reading the merge request file {}", file.display()))?;
++    serde_json::from_str(&text).context("the merge request file is not the expected JSON")
++}
++
++/// What came of posting a review: the comments that reached the merge
++/// request, and the first error among those that did not.
++pub struct PostOutcome {
++    pub merge_request: MergeRequest,
++    pub posted_ids: Vec<usize>,
++    pub error: Option<anyhow::Error>,
++}
++
++/// How many comments post at once. GitLab copes with a few in flight, and
++/// each call costs a round trip, so this hides most of the latency.
++const CONCURRENT_POSTS: usize = 4;
++
++/// Posts `comments` as inline discussions on the open merge request whose
++/// source branch is `branch`, a few at a time. Every comment is attempted;
++/// the ones GitLab rejects stay in the editor.
++pub async fn post_review(
++    work_dir: PathBuf,
++    branch: String,
++    comments: Vec<GitLabComment>,
++) -> Result<PostOutcome> {
++    let merge_request = find_merge_request(&work_dir, &branch).await?;
++    let diff_refs = merge_request
++        .diff_refs
++        .clone()
++        .context("the merge request has no diff refs yet; is the branch pushed?")?;
++
++    let endpoint = format!(
++        "projects/:id/merge_requests/{}/discussions",
++        merge_request.iid
++    );
++    let results: Vec<(usize, Result<()>)> = stream::iter(comments)
++        .map(|comment| {
++            let body = discussion_body(&comment, &diff_refs).to_string();
++            let work_dir = work_dir.clone();
++            let endpoint = endpoint.clone();
++            async move {
++                let result = glab_api(&work_dir, "POST", &endpoint, Some(&body))
++                    .await
++                    .map(|_| ())
++                    .with_context(|| {
++                        format!("posting the comment on {}:{}", comment.path, comment.line)
++                    });
++                (comment.id, result)
++            }
++        })
++        .buffer_unordered(CONCURRENT_POSTS)
++        .collect()
++        .await;
++
++    let mut posted_ids = Vec::new();
++    let mut error = None;
++    for (id, result) in results {
++        match result {
++            Ok(()) => posted_ids.push(id),
++            Err(err) => {
++                error.get_or_insert(err);
++            }
++        }
++    }
++    Ok(PostOutcome {
++        merge_request,
++        posted_ids,
++        error,
++    })
++}
++
++async fn find_merge_request(work_dir: &Path, branch: &str) -> Result<MergeRequest> {
++    let endpoint = format!(
++        "projects/:id/merge_requests?state=opened&source_branch={}",
++        urlencoding::encode(branch)
++    );
++    let listed = glab_api(work_dir, "GET", &endpoint, None).await?;
++    let iid = first_merge_request_iid(&listed, branch)?;
++    // The list omits diff refs, so fetch the merge request itself.
++    let detail = glab_api(
++        work_dir,
++        "GET",
++        &format!("projects/:id/merge_requests/{iid}"),
++        None,
++    )
++    .await?;
++    serde_json::from_str(&detail).context("the merge request reply is not the expected JSON")
++}
++
++fn first_merge_request_iid(listed: &str, branch: &str) -> Result<u64> {
++    let merge_requests: Vec<MergeRequest> =
++        serde_json::from_str(listed).context("the merge request list is not the expected JSON")?;
++    merge_requests
++        .first()
++        .map(|merge_request| merge_request.iid)
++        .ok_or_else(|| anyhow!("no open merge request has `{branch}` as its source branch"))
++}
++
++/// The JSON body that creates one inline discussion on the new side of the diff.
++fn discussion_body(comment: &GitLabComment, diff_refs: &DiffRefs) -> serde_json::Value {
++    json!({
++        "body": comment.body,
++        "position": {
++            "position_type": "text",
++            "base_sha": diff_refs.base_sha,
++            "head_sha": diff_refs.head_sha,
++            "start_sha": diff_refs.start_sha,
++            "new_path": comment.path,
++            "old_path": comment.path,
++            "new_line": comment.line,
++        }
++    })
++}
++
++/// Runs `glab api` in `work_dir` and returns the response body.
++async fn glab_api(
++    work_dir: &Path,
++    method: &str,
++    endpoint: &str,
++    body: Option<&str>,
++) -> Result<String> {
++    let mut command = new_command("glab");
++    command
++        .args(["api", "--method", method, endpoint])
++        .current_dir(work_dir)
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++    if body.is_some() {
++        command.args(["--input", "-"]).stdin(Stdio::piped());
++    } else {
++        command.stdin(Stdio::null());
++    }
++    let mut child = command
++        .spawn()
++        .context("could not run `glab`; install it and run `glab auth login`")?;
++    if let Some(body) = body {
++        let mut stdin = child
++            .stdin
++            .take()
++            .context("could not write the request body to `glab`")?;
++        stdin.write_all(body.as_bytes()).await?;
++        stdin.close().await?;
++    }
++    let output = child.output().await.context("waiting for `glab`")?;
++    if !output.status.success() {
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        bail!(
++            "`glab api {endpoint}` failed: {}",
++            [stderr.trim(), stdout.trim()]
++                .into_iter()
++                .filter(|text| !text.is_empty())
++                .collect::<Vec<_>>()
++                .join("\n")
++        );
++    }
++    String::from_utf8(output.stdout).context("`glab` replied with invalid UTF-8")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn discussion_body_places_the_comment_on_the_new_side() {
++        let comment = GitLabComment {
++            id: 7,
++            path: "src/loop.rs".into(),
++            line: 41,
++            body: "Why not reuse the hunk key?".into(),
++        };
++        let diff_refs = DiffRefs {
++            base_sha: "b".into(),
++            head_sha: "h".into(),
++            start_sha: "s".into(),
++        };
++
++        assert_eq!(
++            discussion_body(&comment, &diff_refs),
++            json!({
++                "body": "Why not reuse the hunk key?",
++                "position": {
++                    "position_type": "text",
++                    "base_sha": "b",
++                    "head_sha": "h",
++                    "start_sha": "s",
++                    "new_path": "src/loop.rs",
++                    "old_path": "src/loop.rs",
++                    "new_line": 41,
++                }
++            })
++        );
++    }
++
++    #[test]
++    fn first_merge_request_iid_reads_the_list_and_rejects_an_empty_one() {
++        let listed = r#"[{"iid": 1565, "web_url": "https://gitlab.com/x/-/merge_requests/1565"}]"#;
++        assert_eq!(first_merge_request_iid(listed, "feature").unwrap(), 1565);
++
++        let error = first_merge_request_iid("[]", "feature").unwrap_err();
++        assert!(error.to_string().contains("`feature`"));
++        assert!(first_merge_request_iid("not json", "feature").is_err());
++    }
++
++    #[test]
++    fn merge_request_detail_parses_diff_refs() {
++        let detail = r#"{
++            "iid": 3,
++            "web_url": "https://gitlab.com/x/-/merge_requests/3",
++            "diff_refs": {"base_sha": "b", "head_sha": "h", "start_sha": "s"},
++            "title": "Add a thing",
++            "description": "Why the thing.",
++            "author": {"name": "Ada", "username": "ada"}
++        }"#;
++        let merge_request: MergeRequest = serde_json::from_str(detail).unwrap();
++        assert_eq!(merge_request.title, "Add a thing");
++        assert_eq!(merge_request.description.as_deref(), Some("Why the thing."));
++        assert_eq!(
++            merge_request.author.as_ref().map(|a| a.name.as_str()),
++            Some("Ada")
++        );
++        assert_eq!(
++            merge_request.diff_refs,
++            Some(DiffRefs {
++                base_sha: "b".into(),
++                head_sha: "h".into(),
++                start_sha: "s".into(),
++            })
++        );
++    }
++}
+diff --git a/crates/git_ui/src/project_diff.rs b/crates/git_ui/src/project_diff.rs
+index b9e64d7937..620c772d8b 100644
+--- a/crates/git_ui/src/project_diff.rs
++++ b/crates/git_ui/src/project_diff.rs
+@@ -1,10 +1,11 @@
+ use crate::{
+     branch_diff::BranchDiff,
+-    diff_multibuffer::DiffMultibuffer,
++    diff_multibuffer::{DiffMultibuffer, ReviewOrderState},
+     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
+     staged_diff::StagedDiff,
+     unstaged_diff::UnstagedDiff,
+ };
++use agent_settings::AgentSettings;
+ use anyhow::{Context as _, Result};
+ use buffer_diff::DiffHunkSecondaryStatus;
+ use editor::{
+@@ -27,7 +28,7 @@ use project::{
+ };
+ use schemars::JsonSchema;
+ use serde::Deserialize;
+-use settings::GitDiffBaseSetting;
++use settings::{GitDiffBaseSetting, Settings as _};
+ use std::any::{Any, TypeId};
+ use std::sync::Arc;
+ use ui::{DiffStat, Divider, Tooltip, prelude::*};
+@@ -57,6 +58,14 @@ actions!(
+         LeaderAndFollower,
+         /// Compare with a specific branch
+         CompareWithBranch,
++        /// Asks the commit message model for the order to read the diff's
++        /// files in, then sorts the diff by it.
++        SuggestReviewOrder,
++        /// Sorts the diff by the git panel's order again.
++        ClearReviewOrder,
++        /// Posts the review comments as inline discussions on the open
++        /// GitLab merge request of the current branch, through `glab`.
++        PostReviewToGitLab,
+     ]
+ );
+ 
+@@ -397,6 +406,22 @@ impl ProjectDiff {
+     pub fn excerpt_file_paths(&self, cx: &App) -> Vec<String> {
+         self.diff.read(cx).excerpt_file_paths(cx)
+     }
++
++    #[cfg(any(test, feature = "test-support"))]
++    pub(crate) fn set_review_order(
++        &mut self,
++        order: Option<Arc<crate::review_order::ReviewOrder>>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.set_review_order(order, window, cx));
++    }
++
++    #[cfg(any(test, feature = "test-support"))]
++    pub(crate) fn review_order_block_count(&self, cx: &App) -> usize {
++        self.diff.read(cx).review_order_block_count()
++    }
+ }
+ 
+ struct ButtonStates {
+@@ -583,9 +608,46 @@ impl Item for ProjectDiff {
+     }
+ }
+ 
++impl ProjectDiff {
++    fn suggest_review_order(
++        &mut self,
++        _: &SuggestReviewOrder,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.suggest_review_order(window, cx));
++    }
++
++    fn clear_review_order(
++        &mut self,
++        _: &ClearReviewOrder,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.clear_review_order(window, cx));
++    }
++
++    fn post_review_to_gitlab(
++        &mut self,
++        _: &PostReviewToGitLab,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
++    }
++}
++
+ impl Render for ProjectDiff {
+-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+-        div().size_full().child(self.diff.clone())
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        div()
++            .size_full()
++            .on_action(cx.listener(Self::suggest_review_order))
++            .on_action(cx.listener(Self::clear_review_order))
++            .on_action(cx.listener(Self::post_review_to_gitlab))
++            .child(self.diff.clone())
+     }
+ }
+ 
+@@ -820,6 +882,9 @@ impl Render for ProjectDiffToolbar {
+ 
+         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
+         let is_multibuffer_empty = project_diff.read(cx).multibuffer(cx).read(cx).is_empty();
++        let review_order_button = (!is_multibuffer_empty
++            && AgentSettings::get_global(cx).enabled(cx))
++        .then(|| render_review_order_button(project_diff.read(cx).diff.read(cx), &focus_handle));
+ 
+         let stage_all_button_width = rems(5.);
+ 
+@@ -960,18 +1025,80 @@ impl Render for ProjectDiffToolbar {
+                         this.dispatch_action(&Commit, window, cx);
+                     })),
+             )
++            .when_some(review_order_button, |el, (button, action)| {
++                el.child(Divider::vertical())
++                    .child(button.on_click(cx.listener(move |this, _, window, cx| {
++                        this.dispatch_action(action.as_ref(), window, cx)
++                    })))
++            })
+             .when(review_count > 0, |el| {
+-                el.child(Divider::vertical()).child(
+-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+-                        cx.listener(|this, _, window, cx| {
+-                            this.dispatch_action(&SendReviewToAgent, window, cx)
+-                        }),
+-                    ),
+-                )
++                let posting = project_diff.read(cx).diff.read(cx).is_posting_review();
++                el.child(Divider::vertical())
++                    .child(
++                        render_send_review_to_agent_button(review_count, &focus_handle).on_click(
++                            cx.listener(|this, _, window, cx| {
++                                this.dispatch_action(&SendReviewToAgent, window, cx)
++                            }),
++                        ),
++                    )
++                    .child(
++                        render_post_review_to_gitlab_button(review_count, posting, &focus_handle)
++                            .on_click(cx.listener(|this, _, window, cx| {
++                                this.dispatch_action(&PostReviewToGitLab, window, cx)
++                            })),
++                    )
+             })
+     }
+ }
+ 
++/// The toolbar button for the review order, with the action a click sends.
++///
++/// It reads "Suggest Review Order" until an order is set, then "Clear Review
++/// Order"; while the model is working it is disabled.
++pub(crate) fn render_review_order_button(
++    diff: &DiffMultibuffer,
++    focus_handle: &FocusHandle,
++) -> (Button, Box<dyn Action>) {
++    let icon = |name: IconName| Icon::new(name).size(IconSize::Small).color(Color::Muted);
++    match (diff.review_order_state(), diff.review_order()) {
++        (ReviewOrderState::Suggesting, _) => (
++            Button::new("review-order", "Ordering files…")
++                .start_icon(icon(IconName::ZedAssistant))
++                .disabled(true),
++            SuggestReviewOrder.boxed_clone(),
++        ),
++        (ReviewOrderState::WaitingForModel, _) => (
++            Button::new("review-order", "Waiting for a model…")
++                .start_icon(icon(IconName::ZedAssistant))
++                .disabled(true),
++            SuggestReviewOrder.boxed_clone(),
++        ),
++        (_, Some(order)) => (
++            Button::new(
++                "review-order",
++                format!("Clear Review Order ({})", order.len()),
++            )
++            .start_icon(icon(IconName::ListTree))
++            .tooltip(Tooltip::for_action_title_in(
++                "Sort the files by path again",
++                &ClearReviewOrder,
++                focus_handle,
++            )),
++            ClearReviewOrder.boxed_clone(),
++        ),
++        (_, None) => (
++            Button::new("review-order", "Suggest Review Order")
++                .start_icon(icon(IconName::ZedAssistant))
++                .tooltip(Tooltip::for_action_title_in(
++                    "Ask the model which order to read these files in",
++                    &SuggestReviewOrder,
++                    focus_handle,
++                )),
++            SuggestReviewOrder.boxed_clone(),
++        ),
++    }
++}
++
+ pub(crate) fn render_send_review_to_agent_button(
+     review_count: usize,
+     focus_handle: &FocusHandle,
+@@ -992,6 +1119,31 @@ pub(crate) fn render_send_review_to_agent_button(
+     ))
+ }
+ 
++/// The toolbar button that posts the review comments to the merge request.
++pub(crate) fn render_post_review_to_gitlab_button(
++    review_count: usize,
++    posting: bool,
++    focus_handle: &FocusHandle,
++) -> Button {
++    let label = if posting {
++        "Posting to GitLab…".to_string()
++    } else {
++        format!("Post Review to GitLab ({review_count})")
++    };
++    Button::new("post-review-gitlab", label)
++        .start_icon(
++            Icon::new(IconName::Gitlab)
++                .size(IconSize::Small)
++                .color(Color::Muted),
++        )
++        .disabled(posting)
++        .tooltip(Tooltip::for_action_title_in(
++            "Post all review comments to the branch's open merge request",
++            &PostReviewToGitLab,
++            focus_handle,
++        ))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use buffer_diff::DiffHunkSecondaryStatus;
+@@ -2260,6 +2412,90 @@ mod tests {
+         assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+     }
+ 
++    #[gpui::test]
++    async fn test_review_order_sorts_listed_files_first(cx: &mut TestAppContext) {
++        use crate::review_order::{ReviewNote, ReviewOrder, ReviewOrderEntry};
++        use git::repository::repo_path;
++
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({
++                ".git": {},
++                "a.rs": "A\n",
++                "b.rs": "B\n",
++                "c.rs": "C\n",
++            }),
++        )
++        .await;
++        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        let diff = cx.new_window_entity(|window, cx| {
++            ProjectDiff::new(project.clone(), workspace, window, cx)
++        });
++        cx.run_until_parked();
++
++        fs.set_head_and_index_for_repo(
++            path!("/project/.git").as_ref(),
++            &[
++                ("a.rs", "a\n".into()),
++                ("b.rs", "b\n".into()),
++                ("c.rs", "c\n".into()),
++            ],
++        );
++        cx.run_until_parked();
++        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
++        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
++
++        // The order lists `c.rs` then `a.rs`; `b.rs` is left out, so it keeps
++        // its place after the listed files. `c.rs` has two notes, one past the
++        // end of the file, which still gets a block on the last line.
++        let order = ReviewOrder::new([
++            ReviewOrderEntry {
++                path: repo_path("c.rs"),
++                reason: "The main change.".into(),
++                notes: vec![
++                    ReviewNote {
++                        line: 1,
++                        text: "The new value.".into(),
++                    },
++                    ReviewNote {
++                        line: 99,
++                        text: "Past the end.".into(),
++                    },
++                ],
++            },
++            ReviewOrderEntry {
++                path: repo_path("a.rs"),
++                reason: "Tests it.".into(),
++                notes: Vec::new(),
++            },
++        ]);
++        diff.update_in(cx, |diff, window, cx| {
++            diff.set_review_order(Some(Arc::new(order)), window, cx)
++        });
++        cx.run_until_parked();
++        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
++        assert_eq!(paths, vec!["c.rs", "a.rs", "b.rs"]);
++        // Two file headers plus two notes.
++        let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
++        assert_eq!(blocks, 4);
++
++        // Clearing the order restores the path sort.
++        diff.update_in(cx, |diff, window, cx| {
++            diff.set_review_order(None, window, cx)
++        });
++        cx.run_until_parked();
++        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
++        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
++        let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
++        assert_eq!(blocks, 0);
++    }
++
+     #[gpui::test]
+     async fn test_tree_view_orders_directories_before_files(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/git_ui/src/review_notes_prompt.txt b/crates/git_ui/src/review_notes_prompt.txt
+new file mode 100644
+index 0000000000..ac313c6f64
+--- /dev/null
++++ b/crates/git_ui/src/review_notes_prompt.txt
+@@ -0,0 +1,22 @@
++You guide a code reviewer through a diff.
++
++Below is a list of the changed files, with their git status, line counts, and their changed lines. Added lines carry their line number in the new file. Write a few notes that guide the reader through the important parts.
++
++Rules for the notes:
++- At most three notes per file, and none for files a reviewer can skim: generated code, lock files, formatting, renames, and config.
++- A note guides the reader. It says what a part does, how it connects to another file, or what to compare it with. It is not a review finding, a verdict, or a style remark.
++- One sentence, at most twenty words.
++- "line" is a line number shown on a "+" line of that file. Put the note on the first line of the part it describes.
++
++Reply with a JSON array only, no prose before or after it. Each element has two fields: "path", copied exactly from the list, and "notes", an array of objects with "line" and "note". Leave out files with no notes.
++
++Example:
++[
++  {"path": "src/loop.rs", "notes": [
++    {"line": 41, "note": "The new retry loop; the callers in src/client.rs now rely on it stopping."},
++    {"line": 58, "note": "The back-off delay, read from the setting added in config.rs."}
++  ]},
++  {"path": "src/loop_test.rs", "notes": [
++    {"line": 12, "note": "Each case here matches one branch of the loop above."}
++  ]}
++]
+diff --git a/crates/git_ui/src/review_order.rs b/crates/git_ui/src/review_order.rs
+new file mode 100644
+index 0000000000..6d231d5f9d
+--- /dev/null
++++ b/crates/git_ui/src/review_order.rs
+@@ -0,0 +1,432 @@
++//! A suggested order to read the files of a diff in, written by a language model.
++//!
++//! The diff multibuffer sorts its excerpts by this order when one is set, and
++//! shows each file's reason above its first excerpt. Each file may also carry
++//! a few guiding notes, shown above the lines they describe.
++//!
++//! The order and the notes come from two separate requests, so the order can
++//! be applied as soon as its small prompt is answered while the larger notes
++//! prompt is still running.
++
++use anyhow::{Context as _, Result, anyhow};
++use collections::{HashMap, HashSet};
++use git::{repository::RepoPath, status::FileStatus};
++use gpui::SharedString;
++use serde::Deserialize;
++use std::fmt::Write as _;
++
++/// A short note that guides the reviewer through part of a file.
++///
++/// It says what a part does or how it connects to another file. It is not a
++/// review finding.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ReviewNote {
++    /// One-based line in the new version of the file.
++    pub line: u32,
++    pub text: SharedString,
++}
++
++/// One file in a review order, with the model's reason for its place.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ReviewOrderEntry {
++    pub path: RepoPath,
++    pub reason: SharedString,
++    pub notes: Vec<ReviewNote>,
++}
++
++/// The most notes kept for one file, so the diff does not fill with prose.
++pub(crate) const MAX_NOTES_PER_FILE: usize = 3;
++
++/// The files of a diff in the order a reviewer should read them.
++///
++/// Files the model left out keep their usual sort order and come after the
++/// listed ones.
++#[derive(Debug, Default, PartialEq)]
++pub struct ReviewOrder {
++    entries: Vec<ReviewOrderEntry>,
++    position_by_path: HashMap<RepoPath, usize>,
++}
++
++impl ReviewOrder {
++    pub fn new(entries: impl IntoIterator<Item = ReviewOrderEntry>) -> Self {
++        let mut order = Self::default();
++        for entry in entries {
++            if order.position_by_path.contains_key(&entry.path) {
++                continue;
++            }
++            order
++                .position_by_path
++                .insert(entry.path.clone(), order.entries.len());
++            order.entries.push(entry);
++        }
++        order
++    }
++
++    pub fn entries(&self) -> &[ReviewOrderEntry] {
++        &self.entries
++    }
++
++    pub fn len(&self) -> usize {
++        self.entries.len()
++    }
++
++    /// The zero-based place of a file in the order, if the model listed it.
++    pub fn position(&self, path: &RepoPath) -> Option<usize> {
++        self.position_by_path.get(path).copied()
++    }
++
++    /// The same order with each file's notes replaced by `notes`. Files
++    /// without an entry in `notes` lose theirs.
++    pub fn with_notes(&self, mut notes: ReviewNotes) -> Self {
++        Self::new(self.entries.iter().map(|entry| ReviewOrderEntry {
++            path: entry.path.clone(),
++            reason: entry.reason.clone(),
++            notes: notes.remove(&entry.path).unwrap_or_default(),
++        }))
++    }
++}
++
++/// Guiding notes keyed by the file they belong to.
++pub type ReviewNotes = HashMap<RepoPath, Vec<ReviewNote>>;
++
++/// What the prompts tell the model about one changed file.
++pub(crate) struct ReviewOrderFile {
++    pub path: RepoPath,
++    pub status: FileStatus,
++    pub added_lines: usize,
++    pub removed_lines: usize,
++    /// The first changed lines of the file as `+` and `-` lines, already
++    /// capped. Added lines carry their line number so notes can point at them.
++    pub excerpt: String,
++}
++
++/// The most bytes of changed lines sent for one file in the order prompt,
++/// which only needs a taste of each file to place it.
++pub(crate) const ORDER_EXCERPT_BYTES_PER_FILE: usize = 800;
++/// The most bytes of changed lines sent in the whole order prompt.
++pub(crate) const ORDER_EXCERPT_BYTES_TOTAL: usize = 16_000;
++/// The most bytes of changed lines sent for one file in the notes prompt.
++pub(crate) const MAX_EXCERPT_BYTES_PER_FILE: usize = 6_000;
++/// The most bytes of changed lines sent in the whole notes prompt.
++pub(crate) const MAX_EXCERPT_BYTES_TOTAL: usize = 60_000;
++
++/// The prompt that asks for the reading order, kept small so it answers fast.
++pub(crate) fn build_order_prompt(files: &[ReviewOrderFile], instructions: Option<&str>) -> String {
++    let mut prompt = include_str!("review_order_prompt.txt").to_string();
++    append_instructions(&mut prompt, instructions);
++    append_files(
++        &mut prompt,
++        files,
++        ORDER_EXCERPT_BYTES_PER_FILE,
++        ORDER_EXCERPT_BYTES_TOTAL,
++    );
++    prompt
++}
++
++/// The prompt that asks for guiding notes, with as much of each file as the
++/// budget allows.
++pub(crate) fn build_notes_prompt(files: &[ReviewOrderFile], instructions: Option<&str>) -> String {
++    let mut prompt = include_str!("review_notes_prompt.txt").to_string();
++    append_instructions(&mut prompt, instructions);
++    append_files(
++        &mut prompt,
++        files,
++        MAX_EXCERPT_BYTES_PER_FILE,
++        MAX_EXCERPT_BYTES_TOTAL,
++    );
++    prompt
++}
++
++fn append_instructions(prompt: &mut String, instructions: Option<&str>) {
++    if let Some(instructions) = instructions.map(str::trim).filter(|s| !s.is_empty()) {
++        write!(
++            prompt,
++            "\nExtra instructions from the reviewer:\n{instructions}\n"
++        )
++        .ok();
++    }
++}
++
++fn append_files(
++    prompt: &mut String,
++    files: &[ReviewOrderFile],
++    per_file_budget: usize,
++    total_budget: usize,
++) {
++    writeln!(prompt, "\nChanged files ({}):", files.len()).ok();
++    let mut budget = total_budget;
++    for file in files {
++        writeln!(
++            prompt,
++            "\n### {} ({}, +{} -{})",
++            file.path.as_unix_str(),
++            status_label(file.status),
++            file.added_lines,
++            file.removed_lines
++        )
++        .ok();
++        if budget == 0 || file.excerpt.is_empty() {
++            continue;
++        }
++        let excerpt = truncate_to_lines(&file.excerpt, budget.min(per_file_budget));
++        budget = budget.saturating_sub(excerpt.len());
++        writeln!(prompt, "```diff\n{excerpt}\n```").ok();
++    }
++}
++
++fn status_label(status: FileStatus) -> &'static str {
++    if status.is_conflicted() {
++        "conflicted"
++    } else if status.is_created() {
++        "added"
++    } else if status.is_deleted() {
++        "deleted"
++    } else {
++        "modified"
++    }
++}
++
++/// Cuts `text` at the last line break before `max_bytes`, so a line is never
++/// split in the middle of a character or a word.
++fn truncate_to_lines(text: &str, max_bytes: usize) -> &str {
++    if text.len() <= max_bytes {
++        return text.trim_end();
++    }
++    let cut = text[..max_bytes].rfind('\n').unwrap_or(0);
++    text[..cut].trim_end()
++}
++
++#[derive(Deserialize)]
++struct RawEntry {
++    path: String,
++    #[serde(default)]
++    reason: String,
++    #[serde(default)]
++    notes: Vec<RawNote>,
++}
++
++#[derive(Deserialize)]
++struct RawNote {
++    #[serde(default)]
++    line: u32,
++    #[serde(default)]
++    note: String,
++}
++
++/// The JSON array in a reply, with the paths resolved against the diff.
++///
++/// Prose around the array is tolerated. Paths that are not in `known_paths`
++/// are dropped, as are repeats.
++fn parse_entries(text: &str, known_paths: &[RepoPath]) -> Result<Vec<(RepoPath, RawEntry)>> {
++    let start = text.find('[').context("the reply has no JSON array")?;
++    let end = text.rfind(']').context("the reply has no JSON array")?;
++    if end < start {
++        return Err(anyhow!("the reply has no JSON array"));
++    }
++    let raw: Vec<RawEntry> =
++        serde_json::from_str(&text[start..=end]).context("the reply is not a JSON array")?;
++
++    let known: HashMap<&str, &RepoPath> = known_paths
++        .iter()
++        .map(|path| (path.as_unix_str(), path))
++        .collect();
++    let mut seen = HashSet::default();
++    let entries = raw
++        .into_iter()
++        .filter_map(|entry| {
++            let path = entry.path.trim().trim_start_matches("./");
++            let path = *known.get(path)?;
++            seen.insert(path.clone()).then(|| (path.clone(), entry))
++        })
++        .collect::<Vec<_>>();
++    if entries.is_empty() {
++        return Err(anyhow!("the reply names no file from this diff"));
++    }
++    Ok(entries)
++}
++
++fn notes_of(entry: RawEntry) -> Vec<ReviewNote> {
++    let mut note_lines = HashSet::default();
++    entry
++        .notes
++        .into_iter()
++        .filter(|note| note.line > 0 && !note.note.trim().is_empty())
++        .filter(|note| note_lines.insert(note.line))
++        .take(MAX_NOTES_PER_FILE)
++        .map(|note| ReviewNote {
++            line: note.line,
++            text: note.note.trim().to_string().into(),
++        })
++        .collect()
++}
++
++/// Reads the order reply into a [`ReviewOrder`]. Notes in the reply, if any,
++/// are kept.
++pub(crate) fn parse_review_order(text: &str, known_paths: &[RepoPath]) -> Result<ReviewOrder> {
++    let entries = parse_entries(text, known_paths)?;
++    Ok(ReviewOrder::new(entries.into_iter().map(
++        |(path, entry)| ReviewOrderEntry {
++            path,
++            reason: entry.reason.trim().to_string().into(),
++            notes: notes_of(entry),
++        },
++    )))
++}
++
++/// Reads the notes reply into notes keyed by file. Files with no usable
++/// notes are left out.
++pub(crate) fn parse_review_notes(text: &str, known_paths: &[RepoPath]) -> Result<ReviewNotes> {
++    let entries = parse_entries(text, known_paths)?;
++    Ok(entries
++        .into_iter()
++        .map(|(path, entry)| (path, notes_of(entry)))
++        .filter(|(_, notes)| !notes.is_empty())
++        .collect())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use git::repository::repo_path;
++
++    #[test]
++    fn parse_keeps_the_models_order_and_drops_unknown_and_repeated_paths() {
++        let known = [
++            repo_path("src/b.rs"),
++            repo_path("src/a.rs"),
++            repo_path("c.rs"),
++        ];
++        let reply = r#"Here is the order:
++[
++  {"path": "src/a.rs", "reason": "The main change."},
++  {"path": "./c.rs", "reason": "Tests it."},
++  {"path": "src/a.rs", "reason": "Repeated."},
++  {"path": "nope.rs", "reason": "Not in the diff."}
++]
++Done."#;
++
++        let order = parse_review_order(reply, &known).unwrap();
++
++        assert_eq!(
++            order
++                .entries()
++                .iter()
++                .map(|entry| entry.path.as_unix_str())
++                .collect::<Vec<_>>(),
++            vec!["src/a.rs", "c.rs"]
++        );
++        assert_eq!(order.position(&repo_path("src/a.rs")), Some(0));
++        assert_eq!(order.position(&repo_path("c.rs")), Some(1));
++        assert_eq!(order.position(&repo_path("src/b.rs")), None);
++        assert_eq!(order.entries()[1].reason.as_ref(), "Tests it.");
++        assert!(order.entries().iter().all(|entry| entry.notes.is_empty()));
++    }
++
++    #[test]
++    fn parse_notes_drops_bad_notes_caps_them_and_merges_into_an_order() {
++        let known = [repo_path("src/a.rs"), repo_path("c.rs")];
++        let reply = r#"[
++  {"path": "src/a.rs", "notes": [
++    {"line": 12, "note": "The retry loop; compare with the old one in c.rs."},
++    {"line": 0, "note": "No line, dropped."},
++    {"line": 12, "note": "Same line again, dropped."},
++    {"line": 30, "note": "   "},
++    {"line": 40, "note": "Second note."},
++    {"line": 50, "note": "Third note."},
++    {"line": 60, "note": "Fourth note, over the cap."}
++  ]},
++  {"path": "c.rs", "notes": []}
++]"#;
++
++        let notes = parse_review_notes(reply, &known).unwrap();
++        assert_eq!(notes.len(), 1);
++        assert_eq!(
++            notes[&repo_path("src/a.rs")],
++            vec![
++                ReviewNote {
++                    line: 12,
++                    text: "The retry loop; compare with the old one in c.rs.".into(),
++                },
++                ReviewNote {
++                    line: 40,
++                    text: "Second note.".into(),
++                },
++                ReviewNote {
++                    line: 50,
++                    text: "Third note.".into(),
++                },
++            ]
++        );
++
++        let order = ReviewOrder::new([
++            ReviewOrderEntry {
++                path: repo_path("c.rs"),
++                reason: "First.".into(),
++                notes: Vec::new(),
++            },
++            ReviewOrderEntry {
++                path: repo_path("src/a.rs"),
++                reason: "Second.".into(),
++                notes: Vec::new(),
++            },
++        ]);
++        let order = order.with_notes(notes);
++        assert_eq!(order.position(&repo_path("c.rs")), Some(0));
++        assert!(order.entries()[0].notes.is_empty());
++        assert_eq!(order.entries()[1].notes.len(), 3);
++    }
++
++    #[test]
++    fn parse_rejects_replies_without_known_files() {
++        let known = [repo_path("src/a.rs")];
++        assert!(parse_review_order("no json here", &known).is_err());
++        assert!(parse_review_order(r#"[{"path": "x.rs"}]"#, &known).is_err());
++        assert!(parse_review_order("[not json]", &known).is_err());
++        assert!(parse_review_notes("no json here", &known).is_err());
++    }
++
++    #[test]
++    fn prompts_list_every_file_and_cap_each_excerpt() {
++        let long_excerpt = (0..400)
++            .map(|i| format!("+{i:>5} |line {i} of a long change"))
++            .collect::<Vec<_>>()
++            .join("\n");
++        let files = vec![
++            ReviewOrderFile {
++                path: repo_path("src/a.rs"),
++                status: FileStatus::Untracked,
++                added_lines: 400,
++                removed_lines: 0,
++                excerpt: long_excerpt,
++            },
++            ReviewOrderFile {
++                path: repo_path("Cargo.lock"),
++                status: FileStatus::Untracked,
++                added_lines: 1,
++                removed_lines: 1,
++                excerpt: String::new(),
++            },
++        ];
++
++        for (prompt, cap) in [
++            (
++                build_order_prompt(&files, Some("Read the lock file last.")),
++                ORDER_EXCERPT_BYTES_PER_FILE,
++            ),
++            (build_notes_prompt(&files, None), MAX_EXCERPT_BYTES_PER_FILE),
++        ] {
++            assert!(prompt.contains("### src/a.rs (added, +400 -0)"));
++            assert!(prompt.contains("### Cargo.lock (added, +1 -1)"));
++            let excerpt_start = prompt.find("```diff\n").unwrap() + "```diff\n".len();
++            let excerpt_end = prompt[excerpt_start..].find("\n```").unwrap();
++            assert!(excerpt_end <= cap);
++            assert!(
++                prompt[excerpt_start..excerpt_start + excerpt_end].ends_with("of a long change")
++            );
++        }
++        assert!(
++            build_order_prompt(&files, Some("Read the lock file last."))
++                .contains("Read the lock file last.")
++        );
++    }
++}
+diff --git a/crates/git_ui/src/review_order_prompt.txt b/crates/git_ui/src/review_order_prompt.txt
+new file mode 100644
+index 0000000000..8ab4b2c993
+--- /dev/null
++++ b/crates/git_ui/src/review_order_prompt.txt
+@@ -0,0 +1,22 @@
++You help a code reviewer read a diff in the best order.
++
++Below is a list of the changed files, with their git status, line counts, and the first changed lines of each. Put the files in the order a careful reviewer should read them.
++
++Rules for the order:
++- Start with the file that carries the main behaviour change, the one every other file depends on.
++- Follow the dependencies: a caller after the function it calls, a test after the code it tests.
++- Put evidence next: tests, fixtures, and eval outputs.
++- End with files a reviewer can skim: generated code, lock files, formatting, renames, and config.
++
++Rules for the reason:
++- One short sentence, at most twelve words, in plain English.
++- Say what the file does in this change, not what the file is.
++
++Reply with a JSON array only, no prose before or after it. Each element has two fields: "path", copied exactly from the list, and "reason". Include every file exactly once.
++
++Example:
++[
++  {"path": "src/loop.rs", "reason": "The retry loop that every other change serves."},
++  {"path": "src/loop_test.rs", "reason": "Proves the loop stops after three retries."},
++  {"path": "Cargo.lock", "reason": "Lock file update, skim."}
++]
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index 78dad31e73..ffbe30fc3e 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -31,7 +31,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
+ use git::GitHostingProviderRegistry;
+ use git_ui::clone::clone_and_open;
+ use gpui::{
+-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
++    App, AppContext, Application, AsyncApp, QuitMode, SharedString, Task, TaskExt,
++    UpdateGlobal as _, block_on,
+ };
+ use gpui_platform;
+ 
+@@ -1255,6 +1256,51 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut
+                 })
+                 .detach_and_log_err(cx);
+             }
++            OpenRequestKind::GitReview {
++                base_ref,
++                merge_request_file,
++            } => {
++                log::info!("review url: opening {:?}", request.open_paths);
++                let base_open_options = zed::open_options_for_request(
++                    request.open_behavior,
++                    &workspace::SerializedWorkspaceLocation::Local,
++                    cx,
++                );
++                cx.spawn(async move |cx| {
++                    let paths_with_position =
++                        derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
++                    let (workspace, _results) = open_paths_with_positions(
++                        &paths_with_position,
++                        &[],
++                        false,
++                        app_state,
++                        base_open_options,
++                        cx,
++                    )
++                    .await?;
++
++                    workspace
++                        .update(cx, |multi_workspace, window, cx| {
++                            multi_workspace
++                                .workspace()
++                                .clone()
++                                .update(cx, |workspace, cx| {
++                                    log::info!("review url: workspace open, deploying branch diff");
++                                    git_ui::branch_diff::BranchDiff::deploy_for_review(
++                                        workspace,
++                                        base_ref.map(SharedString::from),
++                                        merge_request_file.map(PathBuf::from),
++                                        window,
++                                        cx,
++                                    );
++                                })
++                        })
++                        .log_err();
++
++                    anyhow::Ok(())
++                })
++                .detach_and_log_err(cx);
++            }
+         }
+ 
+         return;
+diff --git a/crates/zed/src/zed/open_listener.rs b/crates/zed/src/zed/open_listener.rs
+index 0675fddb75..0d2bfd4832 100644
+--- a/crates/zed/src/zed/open_listener.rs
++++ b/crates/zed/src/zed/open_listener.rs
+@@ -80,6 +80,16 @@ pub enum OpenRequestKind {
+     GitCommit {
+         sha: String,
+     },
++    /// Opens the branch diff of the repository in `open_paths` and asks the
++    /// model for a review order once the files have loaded.
++    GitReview {
++        /// The ref to diff against instead of the default branch, for a
++        /// merge request stacked on another branch.
++        base_ref: Option<String>,
++        /// A JSON file with the merge request, written by the launcher so the
++        /// editor does not fetch it again.
++        merge_request_file: Option<String>,
++    },
+ }
+ 
+ impl std::fmt::Debug for OpenRequestKind {
+@@ -118,6 +128,14 @@ impl std::fmt::Debug for OpenRequestKind {
+                 .field("repo_url", repo_url)
+                 .finish(),
+             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
++            Self::GitReview {
++                base_ref,
++                merge_request_file,
++            } => f
++                .debug_struct("GitReview")
++                .field("base_ref", base_ref)
++                .field("merge_request_file", merge_request_file)
++                .finish(),
+         }
+     }
+ }
+@@ -192,6 +210,8 @@ impl OpenRequest {
+                 this.parse_git_clone_url(clone_path)?
+             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
+                 this.parse_git_commit_url(commit_path)?
++            } else if let Some(review_path) = url.strip_prefix("zed://git/review") {
++                this.parse_git_review_url(review_path)?
+             } else if url.starts_with("ssh://") {
+                 this.parse_ssh_file_path(&url, cx)?
+             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
+@@ -282,6 +302,37 @@ impl OpenRequest {
+         Ok(())
+     }
+ 
++    fn parse_git_review_url(&mut self, review_path: &str) -> Result<()> {
++        // Format: [/]?repo=<path>[&base=<ref>]
++        let query = review_path
++            .trim_start_matches('/')
++            .strip_prefix('?')
++            .context("invalid git review url: missing query string")?;
++
++        let mut repo = None;
++        let mut base_ref = None;
++        let mut merge_request_file = None;
++        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
++            match &*key {
++                "repo" => repo = Some(value.to_string()),
++                "base" => base_ref = Some(value.to_string()),
++                "mr" => merge_request_file = Some(value.to_string()),
++                _ => {}
++            }
++        }
++        let repo = repo
++            .filter(|s| !s.is_empty())
++            .context("invalid git review url: missing repo query parameter")?;
++
++        self.open_paths.push(repo);
++        self.kind = Some(OpenRequestKind::GitReview {
++            base_ref: base_ref.filter(|s| !s.is_empty()),
++            merge_request_file: merge_request_file.filter(|s| !s.is_empty()),
++        });
++
++        Ok(())
++    }
++
+     fn parse_ssh_file_path(&mut self, file: &str, cx: &App) -> Result<()> {
+         let url = parse_ssh_url(file)?;
+         let host = match url
+@@ -1659,6 +1710,72 @@ mod tests {
+         }
+     }
+ 
++    #[gpui::test]
++    fn test_parse_git_review_url(cx: &mut TestAppContext) {
++        let _app_state = init_test(cx);
++
++        for url in [
++            "zed://git/review?repo=path%20with%20spaces",
++            "zed://git/review/?repo=path%20with%20spaces",
++        ] {
++            let request = cx.update(|cx| {
++                OpenRequest::parse(
++                    RawOpenRequest {
++                        urls: vec![url.into()],
++                        ..Default::default()
++                    },
++                    cx,
++                )
++                .unwrap()
++            });
++            assert!(matches!(
++                request.kind,
++                Some(OpenRequestKind::GitReview {
++                    base_ref: None,
++                    merge_request_file: None
++                })
++            ));
++            assert_eq!(request.open_paths, vec!["path with spaces"]);
++        }
++
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec![
++                        "zed://git/review?repo=r&base=origin%2Ffeature%2Fbase&mr=%2Ftmp%2Fmr.json"
++                            .into(),
++                    ],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++        match request.kind {
++            Some(OpenRequestKind::GitReview {
++                base_ref,
++                merge_request_file,
++            }) => {
++                assert_eq!(base_ref.as_deref(), Some("origin/feature/base"));
++                assert_eq!(merge_request_file.as_deref(), Some("/tmp/mr.json"));
++            }
++            other => panic!("unexpected kind {other:?}"),
++        }
++
++        for url in ["zed://git/review", "zed://git/review?repo="] {
++            let result = cx.update(|cx| {
++                OpenRequest::parse(
++                    RawOpenRequest {
++                        urls: vec![url.into()],
++                        ..Default::default()
++                    },
++                    cx,
++                )
++            });
++            assert!(result.is_err(), "{url} should be rejected");
++        }
++    }
++
+     #[gpui::test]
+     fn test_parse_git_commit_url(cx: &mut TestAppContext) {
+         let _app_state = init_test(cx);
+-- 
+2.55.0
+
