@@ -1,6 +1,6 @@
-//! Pick an open merge or pull request you review, and open its diff in Zed
-//! with a suggested review order, guiding notes, and the change's
-//! description above the files.
+//! Pick an open merge or pull request you review, and open its diff in your
+//! editor — Zed, VS Code, or Cursor — with the change's description beside
+//! the files, and in Zed a suggested review order and guiding notes.
 
 mod config;
 mod forge;
@@ -19,14 +19,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Pick a merge or pull request you review and open it in Zed in review
-/// order.
+/// Pick a merge or pull request you review and open it in your editor —
+/// Zed, VS Code, or Cursor.
 ///
-/// Arrow keys move, Enter checks the branch out and opens Zed while the
-/// list stays open, `g` opens the change on GitLab or GitHub, `r` refreshes
-/// the list, `u` and `d` scroll the description, `q` quits. Stacked changes
-/// sit under the one they are stacked on and are diffed against that branch
-/// rather than the default branch.
+/// Arrow keys move, Enter checks the branch out and opens the editor while
+/// the list stays open, `g` opens the change on GitLab or GitHub, `r`
+/// refreshes the list, `u` and `d` scroll the description, `q` quits.
+/// Stacked changes sit under the one they are stacked on and are diffed
+/// against that branch rather than the default branch.
 ///
 /// The first run asks which host you review on and which editor to read
 /// reviews in; `--onboard` asks again.
@@ -59,7 +59,7 @@ struct Args {
     #[arg(long = "zed-app", visible_alias = "app", env = "ZED_APP")]
     zed_app: Option<PathBuf>,
 
-    /// Open this change in Zed straight away, without the list.
+    /// Open this change in your editor straight away, without the list.
     #[arg(long, value_name = "NUMBER")]
     open: Option<u64>,
 
