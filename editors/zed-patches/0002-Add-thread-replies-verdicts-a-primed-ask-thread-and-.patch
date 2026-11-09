@@ -1,7 +1,7 @@
 From 83c40e42c0a093d1ca919bb73319966650d2c9a9 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Tue, 27 Oct 2026 17:55:06 +0000
-Subject: [PATCH 2/4] Add thread replies, verdicts, a primed ask thread and an
+Subject: [PATCH 2/5] Add thread replies, verdicts, a primed ask thread and an
  order cache to the review flow
 
 ---
@@ -6062,5 +6062,5 @@ index 149991a64d..9c57b4e2b0 100644
      #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
      pub struct ConflictContent {
 -- 
-2.55.0
+2.54.0 (Apple Git-157)
 

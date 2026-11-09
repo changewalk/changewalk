@@ -1,0 +1,168 @@
+From 92beec003a089146506fb5d9b6eff3914db48564 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Mon, 9 Nov 2026 17:50:38 +0000
+Subject: [PATCH 5/5] git_ui: Leave n alone in review comment boxes, show
+ verdicts as they happen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The review comment, reply and edit boxes are single-line editors inside
+the diff, so the GitDiff bindings for n and shift-n caught them; the
+bindings now ask for mode == full. The toolbars observe the diff so the
+Post and Approve buttons repaint while a request runs, Approve reads
+Approving… or Withdrawing… meanwhile, and the approval or request for
+changes flips locally on success before the details refetch confirms it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ assets/keymaps/default-macos.json     |  8 +++++---
+ crates/git_ui/src/branch_diff.rs      | 11 ++++++++++-
+ crates/git_ui/src/diff_multibuffer.rs | 20 ++++++++++++++++++++
+ crates/git_ui/src/project_diff.rs     | 19 ++++++++++++++++---
+ 4 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index 7ab117ebb6..18623f904d 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -1179,15 +1179,17 @@
+   },
+   {
+     // Stepping through the review comments; with vim on this takes `n` from
+-    // the search-match motion while a diff is being reviewed.
+-    "context": "GitDiff > Editor && !vim_mode",
++    // the search-match motion while a diff is being reviewed. The comment
++    // boxes are single-line editors inside the diff, so `mode == full` keeps
++    // typing in them untouched.
++    "context": "GitDiff > Editor && mode == full && !vim_mode",
+     "bindings": {
+       "n": "git::NextReviewComment",
+       "shift-n": "git::PreviousReviewComment",
+     },
+   },
+   {
+-    "context": "GitDiff > Editor && VimControl && !menu",
++    "context": "GitDiff > Editor && mode == full && VimControl && !menu",
+     "bindings": {
+       "n": "git::NextReviewComment",
+       "shift-n": "git::PreviousReviewComment",
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index 4ecf9254e0..d8b4d5b631 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -1084,11 +1084,16 @@ impl SerializableItem for BranchDiff {
+ 
+ pub struct BranchDiffToolbar {
+     branch_diff: Option<WeakEntity<BranchDiff>>,
++    /// Repaints the buttons as the diff's review state changes.
++    _diff_observation: Option<Subscription>,
+ }
+ 
+ impl BranchDiffToolbar {
+     pub fn new(_cx: &mut Context<Self>) -> Self {
+-        Self { branch_diff: None }
++        Self {
++            branch_diff: None,
++            _diff_observation: None,
++        }
+     }
+ 
+     fn branch_diff(&self, _: &App) -> Option<Entity<BranchDiff>> {
+@@ -1118,6 +1123,10 @@ impl ToolbarItemView for BranchDiffToolbar {
+         self.branch_diff = active_pane_item
+             .and_then(|item| item.act_as::<BranchDiff>(cx))
+             .map(|entity| entity.downgrade());
++        self._diff_observation = self.branch_diff(cx).map(|branch_diff| {
++            let diff = branch_diff.read(cx).diff.clone();
++            cx.observe(&diff, |_, _, cx| cx.notify())
++        });
+         if self.branch_diff.is_some() {
+             ToolbarItemLocation::PrimaryRight
+         } else {
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index 77f948a55d..09cffe3d13 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -1362,6 +1362,26 @@ impl DiffMultibuffer {
+                             ReviewVerdict::RequestChanges => "Requested changes",
+                         };
+                         this.review_summary.take();
++                        // Show the verdict at once; the details fetch confirms it.
++                        if let Some(header) = this.merge_request.as_mut() {
++                            match verdict {
++                                ReviewVerdict::Approve => {
++                                    if let Some(approvals) = header.approvals.as_mut() {
++                                        approvals.user_has_approved = !approved;
++                                    }
++                                }
++                                ReviewVerdict::RequestChanges => {
++                                    if let Some(reviewer) = header.reviewer.as_mut() {
++                                        reviewer.state = if changes_requested {
++                                            ReviewerState::Reviewed
++                                        } else {
++                                            ReviewerState::RequestedChanges
++                                        };
++                                    }
++                                }
++                                ReviewVerdict::Comment => {}
++                            }
++                        }
+                         this.mark_reviewed(cx);
+                         this.load_merge_request_details(cx);
+                         this.show_review_toast(format!("{what} on !{iid}"), cx);
+diff --git a/crates/git_ui/src/project_diff.rs b/crates/git_ui/src/project_diff.rs
+index ef7e3f58a8..266ac62845 100644
+--- a/crates/git_ui/src/project_diff.rs
++++ b/crates/git_ui/src/project_diff.rs
+@@ -908,6 +908,8 @@ pub(crate) mod persistence {
+ pub struct ProjectDiffToolbar {
+     project_diff: Option<WeakEntity<ProjectDiff>>,
+     workspace: WeakEntity<Workspace>,
++    /// Repaints the buttons as the diff's review state changes.
++    _diff_observation: Option<Subscription>,
+ }
+ 
+ impl ProjectDiffToolbar {
+@@ -915,6 +917,7 @@ impl ProjectDiffToolbar {
+         Self {
+             project_diff: None,
+             workspace: workspace.weak_handle(),
++            _diff_observation: None,
+         }
+     }
+ 
+@@ -970,6 +973,10 @@ impl ToolbarItemView for ProjectDiffToolbar {
+         self.project_diff = active_pane_item
+             .and_then(|item| item.act_as::<ProjectDiff>(cx))
+             .map(|entity| entity.downgrade());
++        self._diff_observation = self.project_diff(cx).map(|project_diff| {
++            let diff = project_diff.read(cx).diff.clone();
++            cx.observe(&diff, |_, _, cx| cx.notify())
++        });
+         if self.project_diff.is_some() {
+             ToolbarItemLocation::PrimaryRight
+         } else {
+@@ -1286,10 +1293,16 @@ pub(crate) fn render_review_buttons(
+         );
+     }
+     if let Some((approved, busy)) = diff.approval_state() {
+-        let (label, tooltip) = if approved {
+-            ("Unapprove", "Withdraw your approval of the merge request")
++        let tooltip = if approved {
++            "Withdraw your approval of the merge request"
+         } else {
+-            ("Approve", "Approve the merge request")
++            "Approve the merge request"
++        };
++        let label = match (approved, busy) {
++            (true, true) => "Withdrawing…",
++            (true, false) => "Unapprove",
++            (false, true) => "Approving…",
++            (false, false) => "Approve",
+         };
+         buttons.push(
+             Button::new("approve-merge-request", label)
+-- 
+2.54.0 (Apple Git-157)
+

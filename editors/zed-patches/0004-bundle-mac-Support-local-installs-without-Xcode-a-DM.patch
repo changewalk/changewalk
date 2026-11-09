@@ -1,7 +1,7 @@
 From 32a6905b6f8535e1e4740c6e649aa780c021a6c4 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Fri, 6 Nov 2026 11:21:55 +0000
-Subject: [PATCH 4/4] bundle-mac: Support local installs without Xcode, a DMG,
+Subject: [PATCH 4/5] bundle-mac: Support local installs without Xcode, a DMG,
  or admin rights
 
 Compile shaders at launch when the metal compiler is missing, skip DMG
@@ -62,5 +62,5 @@ index 6e1489f31a..9becad82f0 100755
          if [ "$local_install" = false ]; then
              echo "Created application bundle:"
 -- 
-2.55.0
+2.54.0 (Apple Git-157)
 
