@@ -18,8 +18,14 @@
 #                        the whole Zed source tree.
 #
 # Usage:
-#   check-zed-patches.sh            # apply onto the pinned ref (editors/zed-patches/UPSTREAM)
-#   check-zed-patches.sh <ref>      # apply onto another ref (tag/branch), for local checks
+#   check-zed-patches.sh                   # apply onto the pinned ref (editors/zed-patches/UPSTREAM)
+#   check-zed-patches.sh --latest-release  # apply onto the newest upstream stable release (moving)
+#   check-zed-patches.sh <ref>             # apply onto a specific ref (tag/branch)
+#
+# CI runs the --latest-release form: it asserts the patch series keeps applying
+# onto whatever the current Zed release is, so the patches can never silently
+# fall behind upstream. (The build, script/build-zed.sh, still uses the pinned
+# ref so the shipped app stays reproducible.)
 #
 # Environment overrides:
 #   ZED_BUILD_DIR     where to clone Zed   (default ~/.cache/changewalk/zed-check)
@@ -44,8 +50,25 @@ command -v git >/dev/null || die "git not found on PATH."
 PINNED="$(tr -d ' \t\r\n' < "$PATCH_DIR/UPSTREAM")"
 [ -n "$PINNED" ] || die "editors/zed-patches/UPSTREAM is empty"
 
-# Target ref: the argument, else the pinned ref.
-REF="${1:-$PINNED}"
+# Target ref: --latest-release resolves the newest stable upstream tag at run
+# time (a moving target); an explicit ref is used as-is; no argument falls back
+# to the pinned ref.
+case "${1:-}" in
+    --latest-release)
+        echo "==> Resolving the latest upstream Zed release ..."
+        # Stable releases are tagged vX.Y.Z; the strict pattern drops previews
+        # like vX.Y.Z-pre. Version-sort and take the newest.
+        REF="$(git ls-remote --tags --refs "$UPSTREAM_URL" 'v*' \
+            | sed -E 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)"
+        [ -n "$REF" ] || die "could not resolve the latest Zed release tag from $UPSTREAM_URL"
+        ;;
+    "")
+        REF="$PINNED" ;;
+    *)
+        REF="$1" ;;
+esac
 
 shopt -s nullglob
 PATCHES=("$PATCH_DIR"/*.patch)

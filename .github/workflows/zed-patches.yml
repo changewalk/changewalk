@@ -1,9 +1,15 @@
 name: Zed patches
 
-# Prove the Zed review-flow patch series still applies onto the pinned upstream
-# Zed (editors/zed-patches/UPSTREAM). No Zed build and no Rust toolchain: this
-# only runs `git am`, so it finishes in seconds. The checkout below fetches a
-# fresh, minimal slice of Zed (one commit, only the touched crates) each run.
+# Assert the Zed review-flow patch series still applies onto the CURRENT
+# upstream Zed release, resolved fresh at run time (a moving target), so the
+# patches can never silently fall behind upstream. No Zed build and no Rust
+# toolchain: this only runs `git am`, so it finishes in seconds, fetching a
+# minimal slice of Zed (one commit, only the touched crates) each run.
+#
+# Note: because the target moves, a green commit can later go red when Zed
+# publishes a new release that conflicts with the patches, with no change to
+# this repo. That is intended: red means "refresh the patch series against the
+# new Zed (script/sync-zed.sh)".
 
 on:
   push:
@@ -16,11 +22,11 @@ concurrency:
 
 jobs:
   apply-check:
-    name: Patches apply onto pinned Zed
+    name: Patches apply onto latest Zed release
     runs-on: ubuntu-latest
     steps:
       - name: Check out this repository
         uses: actions/checkout@v4
 
-      - name: Check the patch series applies
-        run: script/check-zed-patches.sh
+      - name: Assert the patch series applies onto the latest Zed release
+        run: script/check-zed-patches.sh --latest-release

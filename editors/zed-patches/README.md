@@ -45,15 +45,24 @@ The build dir is self-contained. Pass bundler flags with
 ## Check the patches apply (no build)
 
 ```sh
-script/check-zed-patches.sh   # git am the series onto UPSTREAM, no build
+script/check-zed-patches.sh                   # onto the pinned ref (UPSTREAM)
+script/check-zed-patches.sh --latest-release  # onto the current Zed release (what CI does)
+script/check-zed-patches.sh v1.28.0           # onto a specific ref
 ```
 
 This is the cheap half of the build: it fetches a fresh, minimal slice of Zed
 (one commit, and only the crates the patches touch) and runs `git am` to prove
-the series still applies. It compiles nothing, so it finishes in seconds. CI
-runs it on every push via `.github/workflows/zed-patches.yml`, so a patch edit
-or a pin bump that breaks the series fails the build. Pass a ref to check
-against another upstream point locally, e.g. `script/check-zed-patches.sh main`.
+the series still applies. It compiles nothing, so it finishes in seconds.
+
+CI runs the `--latest-release` form on every push
+(`.github/workflows/zed-patches.yml`): it asserts the patches keep applying
+onto whatever the **current upstream Zed release** is — a deliberately moving
+target — so the series can never silently fall behind. This means a commit that
+was green can later go **red when Zed publishes a new release** that conflicts
+with the patches, with no change to this repo. That red is the signal to
+refresh the series against the new Zed with `script/sync-zed.sh` and bump
+`UPSTREAM`. (The build itself still uses the pinned `UPSTREAM`, so the shipped
+app stays reproducible.)
 
 ## Move onto a newer upstream Zed
 
