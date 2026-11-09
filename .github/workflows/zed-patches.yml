@@ -1,0 +1,26 @@
+name: Zed patches
+
+# Prove the Zed review-flow patch series still applies onto the pinned upstream
+# Zed (editors/zed-patches/UPSTREAM). No Zed build and no Rust toolchain: this
+# only runs `git am`, so it finishes in seconds. The checkout below fetches a
+# fresh, minimal slice of Zed (one commit, only the touched crates) each run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: zed-patches-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply-check:
+    name: Patches apply onto pinned Zed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check the patch series applies
+        run: script/check-zed-patches.sh

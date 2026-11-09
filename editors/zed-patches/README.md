@@ -42,6 +42,19 @@ This clones upstream Zed into `~/.cache/changewalk/zed-build` (override with
 The build dir is self-contained. Pass bundler flags with
 `script/build-zed.sh -- <args>`.
 
+## Check the patches apply (no build)
+
+```sh
+script/check-zed-patches.sh   # git am the series onto UPSTREAM, no build
+```
+
+This is the cheap half of the build: it fetches a fresh, minimal slice of Zed
+(one commit, and only the crates the patches touch) and runs `git am` to prove
+the series still applies. It compiles nothing, so it finishes in seconds. CI
+runs it on every push via `.github/workflows/zed-patches.yml`, so a patch edit
+or a pin bump that breaks the series fails the build. Pass a ref to check
+against another upstream point locally, e.g. `script/check-zed-patches.sh main`.
+
 ## Move onto a newer upstream Zed
 
 ```sh
