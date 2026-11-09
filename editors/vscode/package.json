@@ -33,14 +33,21 @@
     "build": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "typecheck": "tsc --noEmit",
+    "pretest": "tsc -p tsconfig.test.json",
+    "test": "node --test out-test/test/*.test.js",
+    "test:integration": "node esbuild.js && tsc -p tsconfig.test.json && node out-test/test/runTest.js",
     "vscode:prepublish": "node esbuild.js --production",
     "package": "vsce package --no-dependencies",
     "publish:ovsx": "ovsx publish --no-dependencies"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.21.0",
+    "mocha": "^12.0.3",
     "typescript": "^5.4.0"
   }
 }

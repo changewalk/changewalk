@@ -14,20 +14,40 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { Handoff, changeNumber, readHandoff } from "./handoff";
-import { activateGitExtension, changedFiles, fallbackBase, resolveBase } from "./git";
+import { activateGitExtension } from "./git";
+import {
+  ReviewLaunch,
+  changedFiles,
+  fallbackBase,
+  order,
+  parseReviewUri,
+  resolveBase,
+} from "./review";
+
+/** A URI scheme whose content is always empty, for the base side of an
+ *  added file's diff. Works the same in VS Code and Cursor. */
+const EMPTY_SCHEME = "changewalk-empty";
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(EMPTY_SCHEME, {
+      provideTextDocumentContent: () => "",
+    }),
     vscode.window.registerUriHandler({
       handleUri: (uri) => {
         void handleUri(uri).catch(reportError);
       },
     }),
-    vscode.commands.registerCommand("changewalk.openReviewFromFile", async () => {
-      const file = await vscode.window.showInputBox({
-        prompt: "Path to the changewalk hand-off JSON",
-        ignoreFocusOut: true,
-      });
+    vscode.commands.registerCommand("changewalk.openReviewFromFile", async (fileArg?: unknown) => {
+      // A string argument lets the CLI, a test, or a keybinding open a
+      // review straight away; without one we ask.
+      const file =
+        typeof fileArg === "string"
+          ? fileArg
+          : await vscode.window.showInputBox({
+              prompt: "Path to the changewalk hand-off JSON",
+              ignoreFocusOut: true,
+            });
       if (file) {
         await openReview({ mr: file }).catch(reportError);
       }
@@ -39,26 +59,8 @@ export function deactivate(): void {
   // Nothing to tear down; the webview and diffs are owned by VS Code.
 }
 
-interface ReviewLaunch {
-  /** Path to the hand-off JSON. */
-  mr: string;
-  /** The clone the change belongs to. Falls back to the JSON's own repo. */
-  repo?: string;
-  /** What to diff against. Falls back to the target branch. */
-  base?: string;
-}
-
 async function handleUri(uri: vscode.Uri): Promise<void> {
-  const action = uri.path.replace(/^\/+/, "");
-  if (action !== "review") {
-    throw new Error(`unknown changewalk action: ${uri.path || "(none)"}`);
-  }
-  const query = new URLSearchParams(uri.query);
-  const mr = query.get("mr");
-  if (!mr) {
-    throw new Error("the review URL has no mr= hand-off file");
-  }
-  await openReview({ mr, repo: query.get("repo") ?? undefined, base: query.get("base") ?? undefined });
+  await openReview(parseReviewUri(uri.path, uri.query));
 }
 
 async function openReview(launch: ReviewLaunch): Promise<void> {
@@ -80,33 +82,29 @@ async function openDiff(handoff: Handoff, repo: string, base: string | undefined
 
   const baseRef = base ?? fallbackBase(handoff.target_branch);
   const baseSha = await resolveBase(repo, baseRef);
-  const files = order(await changedFiles(repo, baseRef), handoff);
-  if (files.length === 0) {
+  const entries = await changedFiles(repo, baseRef);
+  if (entries.length === 0) {
     void vscode.window.showInformationMessage(`${changeNumber(handoff)} has no changed files to review.`);
     return;
   }
+  const added = new Set(entries.filter((entry) => entry.added).map((entry) => entry.path));
+  const files = order(
+    entries.map((entry) => entry.path),
+    handoff,
+  );
 
   const resources = files.map((file) => {
     const fileUri = vscode.Uri.file(path.join(repo, file));
-    const original = git.toGitUri(fileUri, baseSha);
+    // An added file has no content at the base, so its left side is empty
+    // rather than a git URI that would fail to resolve.
+    const original = added.has(file)
+      ? vscode.Uri.from({ scheme: EMPTY_SCHEME, path: file })
+      : git.toGitUri(fileUri, baseSha);
     return [fileUri, original, fileUri] as [vscode.Uri, vscode.Uri, vscode.Uri];
   });
 
   const title = `Review ${changeNumber(handoff)} · ${handoff.title}`;
   await vscode.commands.executeCommand("vscode.changes", title, resources);
-}
-
-/** Puts the files the CLI's reading order names first, in that order, then
- *  any the order did not mention, in git's order. Absent order: git's order. */
-function order(files: string[], handoff: Handoff): string[] {
-  const reading = handoff.review?.order;
-  if (!reading || reading.length === 0) {
-    return files;
-  }
-  const present = new Set(files);
-  const ordered = reading.map((entry) => entry.path).filter((file) => present.has(file));
-  const seen = new Set(ordered);
-  return [...ordered, ...files.filter((file) => !seen.has(file))];
 }
 
 async function showDescription(handoff: Handoff): Promise<void> {
