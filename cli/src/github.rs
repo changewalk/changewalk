@@ -158,7 +158,13 @@ pub fn fetch_merge_request(project: &Project, iid: u64) -> Result<MergeRequest> 
         &token,
     )
     .call()
-    .map_err(|error| anyhow!("fetching #{iid} from {}: {error}", project.path))?
+    .map_err(|error| {
+        anyhow!(
+            "fetching #{iid} from {}: {}",
+            project.path,
+            forge::describe(&error)
+        )
+    })?
     .into_json()
     .context("the pull request reply is not the expected JSON")?;
     Ok(pull.into_merge_request(&username))
@@ -183,7 +189,13 @@ fn search_numbers(project: &Project, token: &str, qualifier: &str) -> Result<Has
         // Required since GitHub retired the old issue-search syntax.
         .query("advanced_search", "true")
         .call()
-        .map_err(|error| anyhow!("searching {} for {qualifier}: {error}", project.path))?
+        .map_err(|error| {
+            anyhow!(
+                "searching {} for {qualifier}: {}",
+                project.path,
+                forge::describe(&error)
+            )
+        })?
         .into_json()
         .context("the search reply is not the expected JSON")?;
     Ok(reply.items.into_iter().map(|item| item.number).collect())
@@ -232,7 +244,13 @@ pub fn fetch_lists(project: &Project, role: Role) -> Result<Vec<MergeRequest>> {
     .query("sort", "updated")
     .query("direction", "desc")
     .call()
-    .map_err(|error| anyhow!("listing pull requests for {}: {error}", project.path))?
+    .map_err(|error| {
+        anyhow!(
+            "listing pull requests for {}: {}",
+            project.path,
+            forge::describe(&error)
+        )
+    })?
     .into_json()
     .context("the pull request list is not the expected JSON")?;
 
@@ -343,7 +361,13 @@ pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Det
         .set("Authorization", &format!("Bearer {token}"))
         .set("Accept", "application/vnd.github+json")
         .send_json(serde_json::json!({ "query": query }))
-        .map_err(|error| anyhow!("fetching diff stats: {error}"))?
+        .map_err(|error| {
+            anyhow!(
+                "fetching details for {}: {}",
+                project.path,
+                forge::describe(&error)
+            )
+        })?
         .into_json()
         .context("the diff stats reply is not the expected JSON")?;
     let repository = reply.data.and_then(|data| data.repository);
@@ -431,7 +455,7 @@ pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Det
                     comment_count: issue_comments.map_or(0, |comments| comments.total_count)
                         + review_comment_count
                         + review_body_count,
-                    my_comment_count,
+                    my_comment_count: Some(my_comment_count),
                     approved_by,
                     user_has_approved,
                 },

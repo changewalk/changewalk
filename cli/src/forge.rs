@@ -338,6 +338,18 @@ pub fn agent() -> ureq::Agent {
         .clone()
 }
 
+/// Why a request failed, without its URL: the message already names the
+/// project, and a URL would push the cause off the end of a status line.
+pub fn describe(error: &ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::Transport(transport) => match transport.message() {
+            Some(message) => format!("{}: {message}", transport.kind()),
+            None => transport.kind().to_string(),
+        },
+    }
+}
+
 /// A token from the first of `vars` that is set in the environment, else
 /// what `cli` prints for `host`.
 ///
@@ -428,7 +440,8 @@ pub struct Details {
     pub additions: u64,
     pub deletions: u64,
     pub comment_count: u64,
-    pub my_comment_count: u64,
+    /// None when the notes were not re-read, so the known count stands.
+    pub my_comment_count: Option<u64>,
     pub approved_by: Vec<String>,
     pub user_has_approved: bool,
 }
@@ -556,6 +569,11 @@ pub fn fetch_lists(
             merge_request.my_comment_count = known.my_comment_count;
             merge_request.counted_sha = known.counted_sha.clone();
             merge_request.details_current = true;
+        } else if let Some(known) = cached.iter().find(|known| known.iid == merge_request.iid) {
+            // The change moved on, so its details are refetched. The comment
+            // counts stand meanwhile, and say whether its notes must be re-read.
+            merge_request.comment_count = known.comment_count;
+            merge_request.my_comment_count = known.my_comment_count;
         }
     }
     Ok(merge_requests)
@@ -564,24 +582,32 @@ pub fn fetch_lists(
 /// Fills in approvals, line counts, and comment counts for the changes
 /// that still need them, in one query per project.
 pub fn fill_details(project: &Project, merge_requests: &mut [MergeRequest]) -> Result<()> {
-    let iids: Vec<u64> = merge_requests
+    let stale: Vec<&MergeRequest> = merge_requests
         .iter()
         .filter(|mr| !mr.details_current)
-        .map(|mr| mr.iid)
         .collect();
-    if iids.is_empty() {
+    if stale.is_empty() {
         return Ok(());
     }
     let details = match project.forge {
-        Forge::Gitlab => crate::gitlab::fetch_details(project, &iids)?,
-        Forge::Github => crate::github::fetch_details(project, &iids)?,
+        Forge::Gitlab => {
+            let known: Vec<(u64, u64)> =
+                stale.iter().map(|mr| (mr.iid, mr.comment_count)).collect();
+            crate::gitlab::fetch_details(project, &known)?
+        }
+        Forge::Github => {
+            let iids: Vec<u64> = stale.iter().map(|mr| mr.iid).collect();
+            crate::github::fetch_details(project, &iids)?
+        }
     };
     for merge_request in merge_requests.iter_mut() {
         if let Some(details) = details.get(&merge_request.iid) {
             merge_request.additions = details.additions;
             merge_request.deletions = details.deletions;
             merge_request.comment_count = details.comment_count;
-            merge_request.my_comment_count = details.my_comment_count;
+            if let Some(mine) = details.my_comment_count {
+                merge_request.my_comment_count = mine;
+            }
             merge_request.approved_by = details.approved_by.clone();
             merge_request.user_has_approved = details.user_has_approved;
             merge_request.counted_sha = None;

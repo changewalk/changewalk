@@ -52,7 +52,13 @@ pub fn fetch_merge_request(project: &Project, iid: u64) -> Result<MergeRequest> 
         .get(&project.api(&format!("merge_requests/{iid}")))
         .set("PRIVATE-TOKEN", &token)
         .call()
-        .map_err(|error| anyhow!("fetching !{iid} from {}: {error}", project.path))?
+        .map_err(|error| {
+            anyhow!(
+                "fetching !{iid} from {}: {}",
+                project.path,
+                forge::describe(&error)
+            )
+        })?
         .into_json()
         .context("the merge request reply is not the expected JSON")
 }
@@ -75,7 +81,13 @@ pub fn fetch_lists(project: &Project, role: Role) -> Result<Vec<MergeRequest>> {
             .query(filter, &username)
             .set("PRIVATE-TOKEN", &token)
             .call()
-            .map_err(|error| anyhow!("listing merge requests for {}: {error}", project.path))?
+            .map_err(|error| {
+                anyhow!(
+                    "listing merge requests for {}: {}",
+                    project.path,
+                    forge::describe(&error)
+                )
+            })?
             .into_json()
             .context("the merge request list is not the expected JSON")
     };
@@ -94,11 +106,12 @@ pub fn fetch_lists(project: &Project, role: Role) -> Result<Vec<MergeRequest>> {
     Ok(merge_requests)
 }
 
-/// Line counts, comment counts, and approvals for every listed merge
-/// request, in one GraphQL query per project. The user's own comments are
-/// counted among the first hundred notes, which covers all but the longest
-/// threads.
-pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Details>> {
+/// Line counts, comment counts, and approvals for the merge requests in
+/// `known`, given as (iid, comment count last seen), in one GraphQL query
+/// per project. Notes are the slow part of that query, so a second one
+/// re-reads them only where the comment count moved, and counts the user's
+/// own among the first hundred, which covers all but the longest threads.
+pub fn fetch_details(project: &Project, known: &[(u64, u64)]) -> Result<HashMap<u64, Details>> {
     #[derive(Deserialize)]
     struct Reply {
         data: Option<Data>,
@@ -162,36 +175,64 @@ pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Det
         #[serde(default)]
         username: String,
     }
-    if iids.is_empty() {
+    if known.is_empty() {
         return Ok(HashMap::new());
     }
     let token = token(&project.host)?;
     let username = username(&project.host, &token)?;
-    let iids: Vec<String> = iids.iter().map(|iid| format!("\"{iid}\"")).collect();
-    let query = format!(
-        "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid userNotesCount diffStatsSummary {{ additions deletions }} approvedBy {{ nodes {{ name username }} }} notes(first: 100) {{ nodes {{ system author {{ username }} }} }} }} }} }} }}",
+    let fetch = |query: String| -> Result<Vec<Node>> {
+        let reply: Reply = forge::agent()
+            .post(&format!("https://{}/api/graphql", project.host))
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(serde_json::json!({ "query": query }))
+            .map_err(|error| {
+                anyhow!(
+                    "fetching details for {}: {}",
+                    project.path,
+                    forge::describe(&error)
+                )
+            })?
+            .into_json()
+            .context("the details reply is not the expected JSON")?;
+        Ok(reply
+            .data
+            .and_then(|data| data.project)
+            .map(|project| project.merge_requests.nodes)
+            .unwrap_or_default())
+    };
+    let quoted = |iids: &[String]| {
+        iids.iter()
+            .map(|iid| format!("\"{iid}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let known: HashMap<u64, u64> = known.iter().copied().collect();
+    let iids: Vec<String> = known.keys().map(u64::to_string).collect();
+    let nodes = fetch(format!(
+        "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid userNotesCount diffStatsSummary {{ additions deletions }} approvedBy {{ nodes {{ name username }} }} }} }} }} }}",
         project.path,
-        iids.join(",")
-    );
-    let reply: Reply = forge::agent()
-        .post(&format!("https://{}/api/graphql", project.host))
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(serde_json::json!({ "query": query }))
-        .map_err(|error| anyhow!("fetching diff stats: {error}"))?
-        .into_json()
-        .context("the diff stats reply is not the expected JSON")?;
-    Ok(reply
-        .data
-        .and_then(|data| data.project)
-        .map(|project| project.merge_requests.nodes)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|node| {
-            let (additions, deletions) = node
-                .diff_stats_summary
-                .map(|summary| (summary.additions, summary.deletions))
-                .unwrap_or_default();
-            let my_comment_count = node
+        quoted(&iids)
+    ))?;
+
+    let moved: Vec<String> = nodes
+        .iter()
+        .filter(|node| {
+            node.iid
+                .parse()
+                .ok()
+                .is_some_and(|iid| known.get(&iid) != Some(&node.user_notes_count))
+        })
+        .map(|node| node.iid.clone())
+        .collect();
+    let mut mine: HashMap<String, u64> = HashMap::new();
+    if !moved.is_empty() {
+        for node in fetch(format!(
+            "{{ project(fullPath: \"{}\") {{ mergeRequests(iids: [{}]) {{ nodes {{ iid notes(first: 100) {{ nodes {{ system author {{ username }} }} }} }} }} }} }}",
+            project.path,
+            quoted(&moved)
+        ))? {
+            let count = node
                 .notes
                 .as_ref()
                 .map(|notes| {
@@ -208,6 +249,17 @@ pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Det
                         .count() as u64
                 })
                 .unwrap_or_default();
+            mine.insert(node.iid, count);
+        }
+    }
+
+    Ok(nodes
+        .into_iter()
+        .filter_map(|node| {
+            let (additions, deletions) = node
+                .diff_stats_summary
+                .map(|summary| (summary.additions, summary.deletions))
+                .unwrap_or_default();
             let approvers = node
                 .approved_by
                 .map(|approvers| approvers.nodes)
@@ -221,7 +273,7 @@ pub fn fetch_details(project: &Project, iids: &[u64]) -> Result<HashMap<u64, Det
                     additions,
                     deletions,
                     comment_count: node.user_notes_count,
-                    my_comment_count,
+                    my_comment_count: mine.get(&node.iid).copied(),
                     approved_by: approvers
                         .into_iter()
                         .map(|approver| approver.name)
