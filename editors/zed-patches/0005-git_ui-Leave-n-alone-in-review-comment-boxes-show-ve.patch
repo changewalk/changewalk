@@ -1,4 +1,4 @@
-From 92beec003a089146506fb5d9b6eff3914db48564 Mon Sep 17 00:00:00 2001
+From 66b8b14b24ad2f49265660d3b3cb2534f4a573c6 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Mon, 9 Nov 2026 17:50:38 +0000
 Subject: [PATCH 5/5] git_ui: Leave n alone in review comment boxes, show
@@ -8,25 +8,27 @@ Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 The review comment, reply and edit boxes are single-line editors inside
-the diff, so the GitDiff bindings for n and shift-n caught them; the
-bindings now ask for mode == full. The toolbars observe the diff so the
-Post and Approve buttons repaint while a request runs, Approve reads
-Approving… or Withdrawing… meanwhile, and the approval or request for
-changes flips locally on success before the details refetch confirms it.
+the diff. A key a box does not bind bubbles up to the diff editor, whose
+GitDiff binding for n and shift-n then fires, so a null binding for those
+keys in single-line editors under GitDiff lets them be typed. The
+toolbars observe the diff so the Post and Approve buttons repaint while
+a request runs, Approve reads Approving… or Withdrawing… meanwhile, and
+the approval or request for changes flips locally on success before the
+details refetch confirms it.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
- assets/keymaps/default-macos.json     |  8 +++++---
+ assets/keymaps/default-macos.json     | 18 +++++++++++++++---
  crates/git_ui/src/branch_diff.rs      | 11 ++++++++++-
  crates/git_ui/src/diff_multibuffer.rs | 20 ++++++++++++++++++++
  crates/git_ui/src/project_diff.rs     | 19 ++++++++++++++++---
- 4 files changed, 51 insertions(+), 7 deletions(-)
+ 4 files changed, 61 insertions(+), 7 deletions(-)
 
 diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
-index 7ab117ebb6..18623f904d 100644
+index 7ab117ebb6..488da88765 100644
 --- a/assets/keymaps/default-macos.json
 +++ b/assets/keymaps/default-macos.json
-@@ -1179,15 +1179,17 @@
+@@ -1179,20 +1179,32 @@
    },
    {
      // Stepping through the review comments; with vim on this takes `n` from
@@ -47,6 +49,21 @@ index 7ab117ebb6..18623f904d 100644
      "bindings": {
        "n": "git::NextReviewComment",
        "shift-n": "git::PreviousReviewComment",
+     },
+   },
++  {
++    // The review comment, reply and edit boxes are single-line editors inside
++    // the diff. A key the box does not bind bubbles up to the diff editor, so
++    // without this `n` typed in a box would step to the next comment instead.
++    "context": "GitDiff > Editor && mode == single_line",
++    "bindings": {
++      "n": null,
++      "shift-n": null,
++    },
++  },
+   {
+     "context": "CommitEditor > Editor",
+     "use_key_equivalents": true,
 diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
 index 4ecf9254e0..d8b4d5b631 100644
 --- a/crates/git_ui/src/branch_diff.rs
