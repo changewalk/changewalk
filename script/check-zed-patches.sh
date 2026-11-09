@@ -75,6 +75,11 @@ echo "==> Sparse dirs  : ${#SPARSE_DIRS[@]} (${SPARSE_DIRS[*]})"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 git -C "$BUILD_DIR" init --quiet
+# `git am` records commits, so it needs an identity. Set a throwaway one local
+# to this build dir, so the script works on a bare CI runner with no global
+# git config (the commits are discarded with the dir at the end).
+git -C "$BUILD_DIR" config user.email "ci@changewalk.invalid"
+git -C "$BUILD_DIR" config user.name "changewalk CI"
 git -C "$BUILD_DIR" remote add origin "$UPSTREAM_URL"
 # Mark origin as a promisor remote so the blobless fetch below is allowed and
 # any missing blob is lazily backfilled on demand.
