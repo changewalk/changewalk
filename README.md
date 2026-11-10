@@ -65,7 +65,10 @@ changes assigned to you instead of ones you review.
 | `q` | Quit |
 
 A refresh also runs `git fetch --prune origin` in each clone, so the branches
-your editor diffs against are current. The change most recently opened is marked
+your editor diffs against are current. On Enter a local branch left from an
+earlier review follows the remote, even after the author rebases, as long as
+it is only an old copy of the remote; one you have committed on is left alone
+and the footer says so. The change most recently opened is marked
 with `●`, and the footer says when. The Approved column shows `✓ you`,
 `✓ you +1`, or `✓ 2`. The Diff column shows lines added and removed, and
 Comments the number of comments with how many are yours. A draft is marked

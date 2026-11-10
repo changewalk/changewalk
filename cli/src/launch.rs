@@ -236,12 +236,29 @@ fn check_out(merge_request: &MergeRequest) -> Result<Option<String>> {
             git(repo, &["checkout", source])?;
         }
         if git(repo, &["merge", "--ff-only", &remote]).is_err() {
+            // The branches have diverged, as they do once the author
+            // rebases. A local branch that sits where the remote once was
+            // is an old copy of it and holds no work of the user's, so it
+            // is moved to the remote; a dirty tree is not reset over.
+            if dirty_files == 0 && remote_was_at(repo, &remote, &git(repo, &["rev-parse", "HEAD"])?)
+            {
+                git(repo, &["reset", "-q", "--hard", &remote])?;
+                return Ok(Some(format!("{source} was reset to {remote}")));
+            }
             return Ok(Some(format!(
-                "{source} is behind {remote} and did not fast-forward"
+                "{source} has diverged from {remote} and was left alone"
             )));
         }
     }
     Ok(warning)
+}
+
+/// Whether the remote-tracking branch has pointed at `sha` at some fetch,
+/// by its reflog. False when the reflog has expired, which errs on the
+/// side of leaving the local branch alone.
+fn remote_was_at(repo: &Path, remote: &str, sha: &str) -> bool {
+    git(repo, &["reflog", "show", "--format=%H", remote])
+        .is_ok_and(|log| log.lines().any(|line| line == sha))
 }
 
 /// Writes the change as JSON for Zed to show above the diff, which saves
@@ -350,6 +367,62 @@ mod tests {
         commit(&repo, "d.txt", "plain\n", "plain");
         sh(&repo, &["push", "-q", "origin", "plain"]);
         assert_eq!(review_base(&merge_request(&repo, "plain", "main")), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A local branch left over from an earlier review follows the remote
+    /// after the author rebases, since it is only an old copy of it. One
+    /// the user has committed on is left where it is.
+    #[test]
+    fn a_stale_review_branch_follows_a_rebased_remote() {
+        let dir = std::env::temp_dir().join(format!("changewalk-stale-{}", std::process::id()));
+        let remote = dir.join("remote.git");
+        let author = dir.join("author");
+        let repo = dir.join("clone");
+        fs::create_dir_all(&remote).unwrap();
+        sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        for clone in ["author", "clone"] {
+            sh(&dir, &["clone", "-q", remote.to_str().unwrap(), clone]);
+            sh(&dir.join(clone), &["config", "user.email", "t@example.com"]);
+            sh(&dir.join(clone), &["config", "user.name", "Test"]);
+        }
+        sh(&author, &["checkout", "-q", "-b", "main"]);
+        commit(&author, "a.txt", "base\n", "base");
+        sh(&author, &["checkout", "-q", "-b", "topic"]);
+        commit(&author, "b.txt", "work\n", "work");
+        sh(&author, &["push", "-q", "origin", "main", "topic"]);
+
+        // First review: the clone gets a local topic at the remote's tip.
+        sh(&repo, &["fetch", "-q", "origin"]);
+        sh(&repo, &["checkout", "-q", "main"]);
+        let mr = merge_request(&repo, "topic", "main");
+        assert_eq!(check_out(&mr).unwrap(), None);
+        let first_tip = sh(&repo, &["rev-parse", "HEAD"]);
+
+        // The author rewrites the branch, so the clone's copy diverges.
+        sh(
+            &author,
+            &["commit", "-q", "--amend", "-m", "work, reworded"],
+        );
+        sh(&author, &["push", "-q", "--force", "origin", "topic"]);
+        let rewritten = sh(&author, &["rev-parse", "HEAD"]);
+
+        let warning = check_out(&mr).unwrap().unwrap();
+        assert!(warning.contains("was reset"), "{warning}");
+        assert_eq!(sh(&repo, &["rev-parse", "HEAD"]), rewritten);
+        assert_ne!(first_tip, rewritten);
+
+        // A commit of the user's own on the branch is not thrown away.
+        let own = commit(&repo, "c.txt", "mine\n", "mine");
+        sh(
+            &author,
+            &["commit", "-q", "--amend", "-m", "work, reworded twice"],
+        );
+        sh(&author, &["push", "-q", "--force", "origin", "topic"]);
+        let warning = check_out(&mr).unwrap().unwrap();
+        assert!(warning.contains("left alone"), "{warning}");
+        assert_eq!(sh(&repo, &["rev-parse", "HEAD"]), own);
 
         fs::remove_dir_all(&dir).ok();
     }
