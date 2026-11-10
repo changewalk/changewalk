@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use std::{
     collections::HashMap,
@@ -20,7 +20,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// One step of a refresh, each carrying the project's whole list with more
@@ -55,6 +55,8 @@ const REMOVED: Color = Color::Red;
 
 /// Marks the merge request most recently opened in Zed.
 const OPENED_MARK: &str = "●";
+/// Turns in the footer while a refresh runs; one frame per draw.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 struct Picker {
     items: Vec<MergeRequest>,
@@ -81,6 +83,10 @@ struct Picker {
     /// The launch in progress, which runs on its own thread because the
     /// fetch and checkout take a moment.
     launching: Option<Receiver<Result<String>>>,
+    /// Whether the key help is open over the description.
+    show_help: bool,
+    /// When the picker started, which paces the refresh spinner.
+    started: Instant,
 }
 
 /// Shows the list until the user quits. Enter hands the selected merge
@@ -113,6 +119,8 @@ pub fn run(
         warm: ide.runs_review_in_editor(),
         fetches: None,
         launching: None,
+        show_help: false,
+        started: Instant::now(),
     };
     if nothing_cached {
         picker.refresh();
@@ -167,6 +175,8 @@ impl Picker {
                             .ok();
                     }
                 }
+                KeyCode::Char('h') | KeyCode::Char('?') => self.show_help = !self.show_help,
+                KeyCode::Esc if self.show_help => self.show_help = false,
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(());
@@ -278,7 +288,6 @@ impl Picker {
         }
         self.pending_fetches = self.projects.len();
         self.fetches = Some(receiver);
-        self.status = "refreshing…".into();
     }
 
     fn receive_launch(&mut self) {
@@ -304,9 +313,7 @@ impl Picker {
         // The launch fetched the clone, so the list's counts and bases can
         // be brought in line with what Zed is now showing.
         if opened {
-            let message = self.status.clone();
             self.refresh();
-            self.status = format!("{message} · refreshing…");
         }
     }
 
@@ -376,7 +383,6 @@ impl Picker {
                     self.selected = selected_iid
                         .and_then(|iid| self.items.iter().position(|mr| mr.iid == iid))
                         .unwrap_or(0);
-                    self.status = "refreshing…".into();
                 }
                 Ok((_, Err(error))) => {
                     self.status = format!("could not refresh: {error:#}");
@@ -396,6 +402,58 @@ impl Picker {
             Layout::vertical([Constraint::Percentage(55), Constraint::Min(5)]).areas(frame.area());
         self.draw_list(frame, list);
         self.draw_description(frame, description);
+        if self.show_help {
+            self.draw_help(frame, description);
+        }
+    }
+
+    /// The keys, in a box over the description, since the footer has room
+    /// only for `h help` once the window narrows.
+    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+        let forge = self.forge().map_or("the web", Forge::name);
+        let keys = [
+            ("↑↓  j k", "move".to_string()),
+            ("⏎", format!("open in {}", self.editor_name)),
+            ("g  o", format!("open on {forge}")),
+            ("r", "refresh".to_string()),
+            ("u  d", "scroll the description".to_string()),
+            ("Home  End  G", "first, last".to_string()),
+            ("h  ?", "close this help".to_string()),
+            ("q  esc", "quit".to_string()),
+        ];
+        let lines: Vec<Line<'static>> = keys
+            .iter()
+            .map(|(key, action)| {
+                Line::from(vec![
+                    Span::styled(format!(" {key:<13}"), Style::default().fg(NUMBER)),
+                    Span::raw(action.clone()),
+                ])
+            })
+            .collect();
+        let width = 44.min(area.width.saturating_sub(2));
+        let height = u16::try_from(lines.len() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.height);
+        let popup = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Keys ");
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Paragraph::new(lines).block(block), popup);
+    }
+
+    /// The spinner frame for this draw, while a refresh runs.
+    fn spinner(&self) -> Option<&'static str> {
+        (self.pending_fetches > 0).then(|| {
+            let tick = self.started.elapsed().as_millis() / 100;
+            SPINNER[usize::try_from(tick % 10).unwrap_or(0)]
+        })
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect) {
@@ -517,14 +575,9 @@ impl Picker {
     }
 
     fn draw_description(&self, frame: &mut Frame, area: Rect) {
-        let mut footer = vec![
-            key_hint("↑↓", "move"),
-            key_hint("⏎", &format!("open in {}", self.editor_name)),
-            key_hint("g", self.forge().map_or("open", Forge::name)),
-            key_hint("r", "refresh"),
-            key_hint("u/d", "scroll"),
-            key_hint("q", "quit"),
-        ];
+        // Narrow windows cut the footer from the right, so the status comes
+        // last but the hints give way to a single `h help` first.
+        let mut footer = vec![key_hint("h", "help")];
         if let Some(opened) = &self.last_opened
             && let Some(merge_request) = self.items.iter().find(|mr| mr.web_url == opened.web_url)
         {
@@ -537,10 +590,15 @@ impl Picker {
                 Style::default().fg(OPENED),
             ));
         }
-        footer.push(Span::styled(
-            format!(" {} ", self.status),
-            Style::default().fg(DIM).italic(),
-        ));
+        // The spinner stands in for a stale "refreshed" time; an error or an
+        // opened message is still worth reading beside it.
+        let stale = self.status.starts_with("refreshed") || self.status.starts_with("press r");
+        let status = match self.spinner() {
+            Some(spinner) if stale => format!(" {spinner} "),
+            Some(spinner) => format!(" {spinner} {} ", self.status),
+            None => format!(" {} ", self.status),
+        };
+        footer.push(Span::styled(status, Style::default().fg(DIM).italic()));
         let footer = Line::from(footer);
         let Some(merge_request) = self.items.get(self.selected) else {
             let loading = format!(" No open {}.", self.plural_noun().to_lowercase());
@@ -899,6 +957,8 @@ mod tests {
                 at: "2026-10-19T11:32:00+01:00".into(),
             }),
             launching: None,
+            show_help: false,
+            started: Instant::now(),
         };
         let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
         terminal.draw(|frame| picker.draw(frame)).unwrap();
@@ -979,6 +1039,8 @@ mod tests {
             fetches: None,
             last_opened: None,
             launching: None,
+            show_help: true,
+            started: Instant::now(),
         };
         let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
         terminal.draw(|frame| picker.draw(frame)).unwrap();
@@ -992,7 +1054,9 @@ mod tests {
             .join("\n");
         assert!(text.contains("Pull requests to review"), "{text}");
         assert!(text.contains("▶ #1628"), "{text}");
-        assert!(text.contains("g GitHub"), "{text}");
+        assert!(text.contains(" h help "), "{text}");
+        assert!(text.contains("open on GitHub"), "{text}");
+        assert!(text.contains("scroll the description"), "{text}");
         assert!(!text.contains("!1628"), "{text}");
     }
 
