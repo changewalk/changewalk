@@ -324,18 +324,41 @@ pub fn remember_opened(merge_request: &MergeRequest) -> LastOpened {
     opened
 }
 
-/// One agent for the whole run, so connections and their TLS handshakes
-/// are reused between requests.
+/// How long the agent may sit unused before it is replaced.
+const AGENT_IDLE_FOR: Duration = Duration::from_secs(30);
+
+/// One agent for a burst of requests, so connections and their TLS
+/// handshakes are reused between them. An agent left unused is replaced:
+/// the picker stays open for hours, and a connection kept across a sleep
+/// or a change of network is dead without saying so, which fails the next
+/// request as a bare "Network Error".
 pub fn agent() -> ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT
-        .get_or_init(|| {
-            ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(20))
-                .timeout(Duration::from_secs(60))
-                .build()
-        })
-        .clone()
+    static AGENT: std::sync::Mutex<Option<(ureq::Agent, u64)>> = std::sync::Mutex::new(None);
+    let mut kept = AGENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = now_seconds();
+    if let Some((agent, last_used)) = kept.as_mut()
+        && !agent_is_stale(*last_used, now)
+    {
+        *last_used = now;
+        return agent.clone();
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60))
+        .build();
+    *kept = Some((agent.clone(), now));
+    agent
+}
+
+/// Whether an agent last used at `last_used` is too old to trust at `now`,
+/// both in seconds by the wall clock: a monotonic clock stops while the
+/// machine sleeps, which is the very gap to be seen. A clock that went
+/// backwards counts as stale.
+fn agent_is_stale(last_used: u64, now: u64) -> bool {
+    now.checked_sub(last_used)
+        .is_none_or(|idle| idle >= AGENT_IDLE_FOR.as_secs())
 }
 
 /// Why a request failed, without its URL: the message already names the
@@ -817,5 +840,16 @@ mod tests {
     fn each_forge_writes_a_number_its_own_way() {
         assert_eq!(Forge::Gitlab.number(12), "!12");
         assert_eq!(Forge::Github.number(12), "#12");
+    }
+
+    /// Requests in one burst share an agent; the next burst after a gap,
+    /// or after the clock went backwards, gets a new one.
+    #[test]
+    fn an_agent_is_kept_for_a_burst_and_dropped_after_a_gap() {
+        assert!(!agent_is_stale(100, 100));
+        assert!(!agent_is_stale(100, 129));
+        assert!(agent_is_stale(100, 130));
+        assert!(agent_is_stale(100, 100 + 4 * 60 * 60));
+        assert!(agent_is_stale(100, 99));
     }
 }
