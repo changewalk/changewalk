@@ -1,7 +1,7 @@
 From 83c40e42c0a093d1ca919bb73319966650d2c9a9 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Tue, 27 Oct 2026 17:55:06 +0000
-Subject: [PATCH 2/6] Add thread replies, verdicts, a primed ask thread and an
+Subject: [PATCH 2/7] Add thread replies, verdicts, a primed ask thread and an
  order cache to the review flow
 
 ---

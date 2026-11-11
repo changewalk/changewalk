@@ -1,0 +1,1653 @@
+From 1433ad823739fb2f2bd6b5408061bed249e11f07 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Wed, 11 Nov 2026 16:50:56 +0000
+Subject: [PATCH 7/7] git_ui: Show and start threads on the merge request
+ itself
+
+A thread with no position on the diff was dropped when the threads were
+read, so a thread opened on the merge request as a whole never showed,
+and there was no way to open one. These threads now sit under the
+description, each folded to a line saying who opened it and whether it
+is resolved, with reply and resolve buttons once opened. A Start Thread
+button in the title row, also the git::StartMergeRequestThread action,
+posts a new one at once. Plain comments, which cannot be resolved, stay
+out.
+
+The threads were also read from the first page of a hundred discussions
+only. Each system note is a discussion of its own, so a busy merge
+request passed that long before it had a hundred threads, and the
+newest threads were the ones cut off. Every page is read now.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/git_ui/src/branch_diff.rs      | 167 +++++-
+ crates/git_ui/src/diff_multibuffer.rs | 777 +++++++++++++++++++++++++-
+ crates/git_ui/src/gitlab_review.rs    | 435 ++++++++++----
+ crates/git_ui/src/project_diff.rs     |  15 +
+ 4 files changed, 1272 insertions(+), 122 deletions(-)
+
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index d8b4d5b631..9a2ecd983a 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -5,9 +5,9 @@ use crate::{
+         self, ApproveMergeRequest, AskAboutDiff, ClearReviewOrder, CompareWithBranch,
+         DeployBranchDiff, FinishReview, GoToReviewComment, MarkReviewed, NextReviewComment,
+         PostReviewToGitLab, PreviousReviewComment, ProjectDiff, RefreshReviewThreads, ReviewDiff,
+-        SuggestReviewOrder, ToggleChangesSinceReview, ToggleMergeRequestDescription,
+-        render_post_review_to_gitlab_button, render_review_buttons, render_review_order_button,
+-        render_send_review_to_agent_button,
++        StartMergeRequestThread, SuggestReviewOrder, ToggleChangesSinceReview,
++        ToggleMergeRequestDescription, render_post_review_to_gitlab_button, render_review_buttons,
++        render_review_order_button, render_send_review_to_agent_button,
+     },
+ };
+ use agent_settings::AgentSettings;
+@@ -731,6 +731,16 @@ impl BranchDiff {
+             .update(cx, |diff, cx| diff.toggle_review_summary(window, cx));
+     }
+ 
++    fn start_merge_request_thread(
++        &mut self,
++        _: &StartMergeRequestThread,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.start_general_thread(window, cx));
++    }
++
+     fn approve_merge_request(
+         &mut self,
+         _: &ApproveMergeRequest,
+@@ -1010,6 +1020,7 @@ impl Render for BranchDiff {
+             .on_action(cx.listener(Self::post_review_to_gitlab))
+             .on_action(cx.listener(Self::refresh_review_threads))
+             .on_action(cx.listener(Self::finish_review))
++            .on_action(cx.listener(Self::start_merge_request_thread))
+             .on_action(cx.listener(Self::approve_merge_request))
+             .on_action(cx.listener(Self::mark_reviewed))
+             .on_action(cx.listener(Self::toggle_merge_request_description))
+@@ -1618,6 +1629,156 @@ mod tests {
+         );
+     }
+ 
++    /// Threads on the merge request itself have no line to sit under, so
++    /// they show under the description: folded to a line, opened by a
++    /// click, and kept as they are on screen across a refresh.
++    #[gpui::test]
++    async fn test_merge_request_threads_show_under_the_description(cx: &mut TestAppContext) {
++        use crate::gitlab_review::{GeneralDiscussion, RemoteNote};
++
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({
++                ".git": {},
++                "a.txt": "C",
++            }),
++        )
++        .await;
++        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        let branch_diff = cx
++            .update(|window, cx| {
++                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
++            })
++            .await
++            .unwrap();
++        workspace.update_in(cx, |workspace, window, cx| {
++            workspace.add_item_to_active_pane(
++                Box::new(branch_diff.clone()),
++                None,
++                true,
++                window,
++                cx,
++            );
++        });
++        fs.set_head_for_repo(
++            Path::new(path!("/project/.git")),
++            &[("a.txt", "B".into())],
++            "sha",
++        );
++        fs.set_merge_base_content_for_repo(
++            Path::new(path!("/project/.git")),
++            &[("a.txt", "A".into())],
++        );
++        cx.run_until_parked();
++
++        let note = |author: &str, body: &str| RemoteNote {
++            id: None,
++            author: author.into(),
++            body: body.into(),
++        };
++        let open_thread = |notes: Vec<RemoteNote>| GeneralDiscussion {
++            id: "open".into(),
++            resolved: false,
++            created_at: None,
++            notes,
++        };
++        let resolved_thread = || GeneralDiscussion {
++            id: "resolved".into(),
++            resolved: true,
++            created_at: None,
++            notes: vec![note("Bob", "Is there a recording?")],
++        };
++
++        let diff = branch_diff.read_with(cx, |branch_diff, _| branch_diff.diff.clone());
++        diff.update(cx, |diff, cx| {
++            diff.show_merge_request_for_test(cx);
++            // Before any thread is known there is nothing to show.
++            assert_eq!(diff.general_thread_counts(), None);
++            diff.apply_general_threads(
++                vec![
++                    open_thread(vec![note("Ada", "The after video looks the same to me.")]),
++                    resolved_thread(),
++                ],
++                cx,
++            );
++        });
++        cx.run_until_parked();
++
++        // Both threads are drawn, the resolved one included, each on a line.
++        let section = cx.debug_bounds("merge-request-threads").unwrap();
++        let open_line = cx.debug_bounds("general-thread-0").unwrap();
++        let resolved_line = cx.debug_bounds("general-thread-1").unwrap();
++        assert!(section.size.height > px(0.));
++        assert!(resolved_line.origin.y > open_line.origin.y);
++        assert!(cx.debug_bounds("general-thread-body-0").is_none());
++        assert_eq!(
++            diff.read_with(cx, |diff, _| diff.general_thread_counts()),
++            Some(("1 open general thread".to_string(), Color::Warning))
++        );
++
++        // A click on the line opens the thread.
++        cx.simulate_click(open_line.center(), gpui::Modifiers::none());
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("general-thread-body-0").is_some());
++        assert!(cx.debug_bounds("general-thread-body-1").is_none());
++
++        // A refresh brings a reply and keeps the thread open; the thread
++        // GitLab no longer lists goes.
++        diff.update(cx, |diff, cx| {
++            diff.apply_general_threads(
++                vec![open_thread(vec![
++                    note("Ada", "The after video looks the same to me."),
++                    note("Bob", "Uploaded the right one."),
++                ])],
++                cx,
++            );
++        });
++        cx.run_until_parked();
++        assert_eq!(
++            diff.read_with(cx, |diff, _| diff.general_threads_for_test()),
++            vec![(
++                "open".to_string(),
++                false,
++                true,
++                vec![
++                    "The after video looks the same to me.".to_string(),
++                    "Uploaded the right one.".to_string()
++                ]
++            )]
++        );
++        assert!(cx.debug_bounds("general-thread-body-0").is_some());
++        assert!(cx.debug_bounds("general-thread-1").is_none());
++
++        // With every thread resolved the title row says so, quietly.
++        diff.update(cx, |diff, cx| {
++            diff.apply_general_threads(vec![resolved_thread()], cx);
++        });
++        assert_eq!(
++            diff.read_with(cx, |diff, _| diff.general_thread_counts()),
++            Some(("1 general thread, resolved".to_string(), Color::Muted))
++        );
++
++        // The box for a new thread opens under the threads, and with the
++        // description folded away the threads fold with it.
++        assert!(cx.debug_bounds("general-thread-new").is_none());
++        diff.update_in(cx, |diff, window, cx| diff.start_general_thread(window, cx));
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("general-thread-new").is_some());
++        diff.update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("merge-request-threads").is_none());
++        // Starting a thread unfolds it again, since the box is under it.
++        diff.update_in(cx, |diff, window, cx| diff.start_general_thread(window, cx));
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("general-thread-new").is_some());
++    }
++
+     #[gpui::test]
+     async fn test_branch_diff_action_matches_existing_item_by_base_ref(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index 108c7d895f..adf422cf4a 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -3,8 +3,8 @@ use crate::{
+     git_panel::{GitPanel, GitStatusEntry},
+     git_panel_settings::GitPanelSettings,
+     gitlab_review::{
+-        self, Approvals, GitLabComment, RelatedIssue, RemoteDiscussion, ReviewerStanding,
+-        ReviewerState,
++        self, Approvals, GeneralDiscussion, GitLabComment, RelatedIssue, RemoteDiscussion,
++        RemoteNote, RemoteThreads, ReviewerStanding, ReviewerState,
+     },
+     review_cache::{self, LastReview},
+     review_order::{
+@@ -41,6 +41,7 @@ use language_model::{
+ };
+ use markdown::{
+     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
++    MarkdownStyle,
+ };
+ use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+ use project::{
+@@ -97,12 +98,20 @@ pub struct DiffMultibuffer {
+     _review_threads_task: Option<Task<()>>,
+     /// The threads, asked for as soon as the merge request is known so they
+     /// are ready by the time the files are.
+-    prefetched_discussions: Option<Task<Result<Vec<RemoteDiscussion>>>>,
++    prefetched_discussions: Option<Task<Result<RemoteThreads>>>,
+     /// Re-runs the thread sync a while after the last one finished.
+     _thread_refresh_task: Option<Task<()>>,
+     /// A reply, resolve, or draft in flight; one at a time is plenty.
+     _review_action_task: Option<Task<()>>,
+     review_summary: Option<ReviewSummary>,
++    /// The threads on the merge request itself, shown under its description.
++    general_threads: Vec<GeneralThread>,
++    /// The box for starting a thread on the merge request itself.
++    new_general_thread: Option<Entity<Editor>>,
++    /// A new thread, a reply, or a resolve on its way to GitLab. The
++    /// buttons are held meanwhile, so one at a time.
++    general_thread_busy: bool,
++    _general_thread_task: Option<Task<()>>,
+     /// A verdict is on its way to GitLab.
+     finishing_review: bool,
+     /// The base the diff had before it was switched to show only the
+@@ -185,6 +194,11 @@ impl Render for DraggedDescriptionEdge {
+ const DEFAULT_DESCRIPTION_HEIGHT: gpui::Rems = rems(18.);
+ const MIN_DESCRIPTION_HEIGHT: gpui::Rems = rems(3.);
+ const DESCRIPTION_HANDLE_SIZE: Pixels = px(6.);
++/// The threads on the merge request itself scroll past this height, so a
++/// long discussion does not push the diff off the screen.
++const GENERAL_THREADS_MAX_HEIGHT: gpui::Rems = rems(20.);
++/// How much of a thread's first line its folded line shows.
++const GENERAL_THREAD_PREVIEW_CHARS: usize = 100;
+ 
+ /// The summary comment being written to finish a review.
+ struct ReviewSummary {
+@@ -193,6 +207,27 @@ struct ReviewSummary {
+     posting: bool,
+ }
+ 
++/// A thread on the merge request itself, not on a line of its diff.
++struct GeneralThread {
++    discussion_id: String,
++    resolved: bool,
++    /// The thread was opened after the user last reviewed the change.
++    since_last_review: bool,
++    /// The opening note first, then the replies.
++    notes: Vec<GeneralNote>,
++    /// Shown in full; otherwise one line.
++    expanded: bool,
++    /// The box for a reply, while one is being written.
++    reply: Option<Entity<Editor>>,
++}
++
++#[derive(Clone)]
++struct GeneralNote {
++    author: SharedString,
++    body: String,
++    markdown: Entity<Markdown>,
++}
++
+ /// One review comment as the overview lists it.
+ #[derive(Clone, Debug)]
+ pub(crate) struct ReviewCommentEntry {
+@@ -374,6 +409,10 @@ impl DiffMultibuffer {
+             _thread_refresh_task: None,
+             _review_action_task: None,
+             review_summary: None,
++            general_threads: Vec::new(),
++            new_general_thread: None,
++            general_thread_busy: false,
++            _general_thread_task: None,
+             finishing_review: false,
+             base_before_since_review: None,
+             held_review_comments: Vec::new(),
+@@ -622,6 +661,10 @@ impl DiffMultibuffer {
+         self._review_notes_task.take();
+         self.merge_request = None;
+         self.review_summary = None;
++        self._general_thread_task.take();
++        self.general_threads.clear();
++        self.new_general_thread = None;
++        self.general_thread_busy = false;
+         self.pending_notes = None;
+         self.held_review_comments.clear();
+         self.posting_review = false;
+@@ -958,7 +1001,21 @@ impl DiffMultibuffer {
+                 };
+                 Some(Label::new(text).size(LabelSize::Small).color(color))
+             }))
++            .children(
++                self.general_thread_counts()
++                    .map(|(text, color)| Label::new(text).size(LabelSize::Small).color(color)),
++            )
+             .child(div().flex_1())
++            .child(
++                Button::new("merge-request-start-thread", "Start Thread")
++                    .label_size(LabelSize::Small)
++                    .tooltip(Tooltip::text(
++                        "Start a thread on the merge request itself, not on a line",
++                    ))
++                    .on_click(
++                        cx.listener(|this, _, window, cx| this.start_general_thread(window, cx)),
++                    ),
++            )
+             .child(
+                 IconButton::new("merge-request-open", IconName::ArrowUpRight)
+                     .icon_size(IconSize::Small)
+@@ -1036,6 +1093,12 @@ impl DiffMultibuffer {
+                     )
+                     .child(handle)
+             });
++        // The threads fold away with the description; the title row still
++        // says how many are open.
++        let threads = header
++            .expanded
++            .then(|| self.render_general_threads(window, cx))
++            .flatten();
+         let summary = self.render_review_summary(cx);
+         let colors = cx.theme().colors();
+         Some(
+@@ -1046,11 +1109,329 @@ impl DiffMultibuffer {
+                 .border_color(colors.border)
+                 .child(title_row)
+                 .children(description)
++                .children(threads)
+                 .children(summary)
+                 .into_any_element(),
+         )
+     }
+ 
++    /// How many threads are on the merge request itself, for its title row.
++    pub(crate) fn general_thread_counts(&self) -> Option<(String, Color)> {
++        let total = self.general_threads.len();
++        let open = self
++            .general_threads
++            .iter()
++            .filter(|thread| !thread.resolved)
++            .count();
++        let threads = |count: usize| if count == 1 { "thread" } else { "threads" };
++        if total == 0 {
++            None
++        } else if open > 0 {
++            Some((
++                format!("{open} open general {}", threads(open)),
++                Color::Warning,
++            ))
++        } else {
++            Some((
++                format!("{total} general {}, resolved", threads(total)),
++                Color::Muted,
++            ))
++        }
++    }
++
++    /// The threads on the merge request itself, each folded to a line until
++    /// clicked, and the box for a new one.
++    fn render_general_threads(
++        &self,
++        window: &Window,
++        cx: &mut Context<Self>,
++    ) -> Option<AnyElement> {
++        if self.general_threads.is_empty() && self.new_general_thread.is_none() {
++            return None;
++        }
++        let markdown_style = editor::hover_markdown_style(window, cx);
++        let threads: Vec<AnyElement> = self
++            .general_threads
++            .iter()
++            .enumerate()
++            .map(|(index, thread)| self.render_general_thread(index, thread, &markdown_style, cx))
++            .collect();
++        let busy = self.general_thread_busy;
++        let colors = cx.theme().colors();
++        let new_thread = self.new_general_thread.clone().map(|editor| {
++            v_flex()
++                .w_full()
++                .debug_selector(|| "general-thread-new".into())
++                .gap_1()
++                .px_2()
++                .py_1()
++                .child(
++                    Label::new(if busy {
++                        "Sending to GitLab…"
++                    } else {
++                        "New thread on the merge request. It stays open until it is resolved."
++                    })
++                    .size(LabelSize::Small)
++                    .color(Color::Muted),
++                )
++                .child(
++                    div()
++                        .w_full()
++                        .border_1()
++                        .border_color(colors.border)
++                        .rounded_md()
++                        .bg(colors.editor_background)
++                        .px_2()
++                        .py_1()
++                        .child(editor),
++                )
++                .child(
++                    h_flex()
++                        .w_full()
++                        .gap_1()
++                        .child(div().flex_1())
++                        .child(
++                            Button::new("general-thread-start", "Start Thread")
++                                .style(ButtonStyle::Filled)
++                                .disabled(busy)
++                                .on_click(cx.listener(|this, _, window, cx| {
++                                    this.post_general_thread(window, cx)
++                                })),
++                        )
++                        .child(
++                            IconButton::new("general-thread-close", IconName::Close)
++                                .icon_size(IconSize::Small)
++                                .tooltip(Tooltip::text("Close"))
++                                .on_click(
++                                    cx.listener(|this, _, _, cx| this.close_new_general_thread(cx)),
++                                ),
++                        ),
++                )
++        });
++        Some(
++            v_flex()
++                .w_full()
++                .debug_selector(|| "merge-request-threads".into())
++                .border_t_1()
++                .border_color(colors.border)
++                .py_1()
++                .when(!threads.is_empty(), |el| {
++                    el.child(
++                        v_flex()
++                            .id("merge-request-threads")
++                            .w_full()
++                            .max_h(GENERAL_THREADS_MAX_HEIGHT)
++                            .overflow_y_scroll()
++                            .px_1()
++                            .gap_0p5()
++                            .children(threads),
++                    )
++                })
++                .children(new_thread)
++                .into_any_element(),
++        )
++    }
++
++    /// One thread on the merge request itself: a line saying who opened it,
++    /// its state and its first words, and under it, when open, the notes
++    /// with the reply and resolve buttons.
++    fn render_general_thread(
++        &self,
++        index: usize,
++        thread: &GeneralThread,
++        markdown_style: &MarkdownStyle,
++        cx: &mut Context<Self>,
++    ) -> AnyElement {
++        let colors = cx.theme().colors();
++        let busy = self.general_thread_busy;
++        let resolved = thread.resolved;
++        let state_color = if resolved {
++            Color::Success
++        } else {
++            Color::Warning
++        };
++        let author = thread
++            .notes
++            .first()
++            .map(|note| note.author.clone())
++            .unwrap_or_default();
++        let preview = thread
++            .notes
++            .first()
++            .map(|note| preview_of(&note.body))
++            .unwrap_or_default();
++        let replies = thread.notes.len().saturating_sub(1);
++        let line = h_flex()
++            .id(("general-thread", index))
++            .debug_selector(|| format!("general-thread-{index}"))
++            .w_full()
++            .px_2()
++            .gap_1p5()
++            .items_center()
++            .rounded_md()
++            .cursor_pointer()
++            .overflow_hidden()
++            .hover(|style| style.bg(colors.ghost_element_hover))
++            .on_click(cx.listener({
++                let discussion_id = thread.discussion_id.clone();
++                move |this, _, _, cx| this.toggle_general_thread(&discussion_id, cx)
++            }))
++            .child(
++                Icon::new(if thread.expanded {
++                    IconName::ChevronDown
++                } else {
++                    IconName::ChevronRight
++                })
++                .size(IconSize::XSmall)
++                .color(Color::Muted),
++            )
++            .child(
++                Icon::new(if resolved {
++                    IconName::CheckDouble
++                } else {
++                    IconName::Chat
++                })
++                .size(IconSize::XSmall)
++                .color(state_color),
++            )
++            .child(Label::new(author).size(LabelSize::Small))
++            .child(
++                Label::new(if resolved { "Resolved" } else { "Open" })
++                    .size(LabelSize::XSmall)
++                    .color(state_color),
++            )
++            .when(thread.since_last_review, |el| {
++                el.child(
++                    Label::new("New")
++                        .size(LabelSize::XSmall)
++                        .color(Color::Accent),
++                )
++            })
++            .when(replies > 0, |el| {
++                el.child(
++                    Label::new(format!(
++                        "{replies} {}",
++                        if replies == 1 { "reply" } else { "replies" }
++                    ))
++                    .size(LabelSize::XSmall)
++                    .color(Color::Muted),
++                )
++            })
++            .when(!thread.expanded, |el| {
++                el.child(
++                    Label::new(preview)
++                        .size(LabelSize::Small)
++                        .color(Color::Muted)
++                        .truncate(),
++                )
++            });
++        if !thread.expanded {
++            return line.into_any_element();
++        }
++
++        let notes = thread.notes.iter().map(|note| {
++            v_flex()
++                .w_full()
++                .child(
++                    Label::new(note.author.clone())
++                        .size(LabelSize::Small)
++                        .weight(FontWeight::SEMIBOLD),
++                )
++                .child(div().w_full().text_sm().child(MarkdownElement::new(
++                    note.markdown.clone(),
++                    markdown_style.clone(),
++                )))
++        });
++        let buttons = match thread.reply.clone() {
++            Some(editor) => v_flex()
++                .w_full()
++                .gap_1()
++                .child(
++                    div()
++                        .w_full()
++                        .border_1()
++                        .border_color(colors.border)
++                        .rounded_md()
++                        .bg(colors.editor_background)
++                        .px_2()
++                        .py_1()
++                        .child(editor),
++                )
++                .child(
++                    h_flex()
++                        .gap_1()
++                        .child(
++                            Button::new(("general-thread-send", index), "Send")
++                                .style(ButtonStyle::Filled)
++                                .disabled(busy)
++                                .on_click(cx.listener({
++                                    let discussion_id = thread.discussion_id.clone();
++                                    move |this, _, window, cx| {
++                                        this.send_general_reply(discussion_id.clone(), window, cx)
++                                    }
++                                })),
++                        )
++                        .child(
++                            Button::new(("general-thread-cancel", index), "Cancel").on_click(
++                                cx.listener({
++                                    let discussion_id = thread.discussion_id.clone();
++                                    move |this, _, _, cx| {
++                                        this.cancel_general_reply(&discussion_id, cx)
++                                    }
++                                }),
++                            ),
++                        ),
++                ),
++            None => v_flex().w_full().child(
++                h_flex()
++                    .gap_1()
++                    .child(
++                        Button::new(("general-thread-reply", index), "Reply")
++                            .disabled(busy)
++                            .on_click(cx.listener({
++                                let discussion_id = thread.discussion_id.clone();
++                                move |this, _, window, cx| {
++                                    this.reply_to_general_thread(&discussion_id, window, cx)
++                                }
++                            })),
++                    )
++                    .child(
++                        Button::new(
++                            ("general-thread-resolve", index),
++                            if resolved { "Reopen" } else { "Resolve" },
++                        )
++                        .disabled(busy)
++                        .on_click(cx.listener({
++                            let discussion_id = thread.discussion_id.clone();
++                            move |this, _, window, cx| {
++                                this.resolve_general_thread(
++                                    discussion_id.clone(),
++                                    !resolved,
++                                    window,
++                                    cx,
++                                )
++                            }
++                        })),
++                    ),
++            ),
++        };
++        v_flex()
++            .w_full()
++            .child(line)
++            .child(
++                v_flex()
++                    .w_full()
++                    .debug_selector(|| format!("general-thread-body-{index}"))
++                    .pl_6()
++                    .pr_2()
++                    .pb_1()
++                    .gap_1p5()
++                    .children(notes)
++                    .child(buttons),
++            )
++            .into_any_element()
++    }
++
+     /// Follows a drag of the description's bottom edge, keeping the height
+     /// between a few lines and the window.
+     fn drag_description_edge(
+@@ -1534,6 +1915,338 @@ impl DiffMultibuffer {
+         }));
+     }
+ 
++    /// Shows the threads on the merge request itself as GitLab has them. A
++    /// thread already shown stays open or folded as it was, and keeps the
++    /// reply being written on it.
++    pub(crate) fn apply_general_threads(
++        &mut self,
++        discussions: Vec<GeneralDiscussion>,
++        cx: &mut Context<Self>,
++    ) {
++        let last_review_at = self
++            .merge_request
++            .as_ref()
++            .and_then(|header| header.last_review.as_ref())
++            .map(|review| review.at);
++        let mut shown: HashMap<String, GeneralThread> = std::mem::take(&mut self.general_threads)
++            .into_iter()
++            .map(|thread| (thread.discussion_id.clone(), thread))
++            .collect();
++        let mut threads = Vec::with_capacity(discussions.len());
++        for discussion in discussions {
++            let since_last_review = last_review_at.is_some_and(|at| {
++                discussion
++                    .created_at
++                    .as_deref()
++                    .and_then(parse_timestamp)
++                    .is_some_and(|created| created > at)
++            });
++            let shown = shown.remove(&discussion.id);
++            threads.push(self.general_thread(discussion, shown, since_last_review, cx));
++        }
++        self.general_threads = threads;
++        cx.notify();
++    }
++
++    /// The thread as GitLab has it, carrying over what `shown` had on
++    /// screen. A note whose text did not change keeps its parsed markdown,
++    /// so a selection in it survives the refresh.
++    fn general_thread(
++        &self,
++        discussion: GeneralDiscussion,
++        shown: Option<GeneralThread>,
++        since_last_review: bool,
++        cx: &mut Context<Self>,
++    ) -> GeneralThread {
++        let (expanded, reply, shown_notes) = match shown {
++            Some(shown) => (shown.expanded, shown.reply, shown.notes),
++            None => (false, None, Vec::new()),
++        };
++        let notes = discussion
++            .notes
++            .into_iter()
++            .enumerate()
++            .map(|(index, note)| match shown_notes.get(index) {
++                Some(shown)
++                    if shown.body == note.body && shown.author.as_ref() == note.author.as_str() =>
++                {
++                    shown.clone()
++                }
++                _ => self.general_note(note, cx),
++            })
++            .collect();
++        GeneralThread {
++            discussion_id: discussion.id,
++            resolved: discussion.resolved,
++            since_last_review,
++            notes,
++            expanded,
++            reply,
++        }
++    }
++
++    /// A note on a merge request thread, with its text parsed for showing.
++    fn general_note(&self, note: RemoteNote, cx: &mut Context<Self>) -> GeneralNote {
++        let languages = self
++            .workspace
++            .upgrade()
++            .map(|workspace| workspace.read(cx).project().read(cx).languages().clone());
++        let text: SharedString = note.body.clone().into();
++        let markdown = cx.new(|cx| {
++            // Notes carry code blocks, diagrams, and HTML details blocks,
++            // which the defaults leave as text.
++            Markdown::new_with_options(
++                text,
++                languages,
++                None,
++                MarkdownOptions {
++                    parse_html: true,
++                    render_mermaid_diagrams: true,
++                    ..Default::default()
++                },
++                cx,
++            )
++        });
++        GeneralNote {
++            author: note.author.into(),
++            body: note.body,
++            markdown,
++        }
++    }
++
++    fn general_thread_mut(&mut self, discussion_id: &str) -> Option<&mut GeneralThread> {
++        self.general_threads
++            .iter_mut()
++            .find(|thread| thread.discussion_id == discussion_id)
++    }
++
++    fn toggle_general_thread(&mut self, discussion_id: &str, cx: &mut Context<Self>) {
++        if let Some(thread) = self.general_thread_mut(discussion_id) {
++            thread.expanded = !thread.expanded;
++            cx.notify();
++        }
++    }
++
++    /// Opens the box for a new thread on the merge request itself, or moves
++    /// to the one already open.
++    pub(crate) fn start_general_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        let Some(header) = self.merge_request.as_mut() else {
++            return;
++        };
++        // The box sits under the description, which may be folded away.
++        header.expanded = true;
++        let editor = match self.new_general_thread.clone() {
++            Some(editor) => editor,
++            None => {
++                let editor = cx.new(|cx| {
++                    let mut editor = Editor::auto_height(2, 10, window, cx);
++                    editor.set_placeholder_text(
++                        "Say what the merge request as a whole needs…",
++                        window,
++                        cx,
++                    );
++                    editor
++                });
++                self.new_general_thread = Some(editor.clone());
++                editor
++            }
++        };
++        let focus_handle = editor.focus_handle(cx);
++        window.focus(&focus_handle, cx);
++        cx.notify();
++    }
++
++    fn close_new_general_thread(&mut self, cx: &mut Context<Self>) {
++        self.new_general_thread = None;
++        cx.notify();
++    }
++
++    /// Posts the text in the box as a new thread on the merge request. The
++    /// box and its text stay if GitLab refuses.
++    fn post_general_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if self.general_thread_busy {
++            return;
++        }
++        let Some(editor) = self.new_general_thread.clone() else {
++            return;
++        };
++        let body = editor.read(cx).text(cx).trim().to_string();
++        if body.is_empty() {
++            return;
++        }
++        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
++            return;
++        };
++        let request = cx.background_spawn(gitlab_review::start_discussion(work_dir, iid, body));
++        self.run_general_thread_request(
++            request,
++            "Could not start the thread",
++            window,
++            cx,
++            move |this, discussion, window, cx| {
++                this.new_general_thread = None;
++                let mut thread = this.general_thread(discussion, None, false, cx);
++                thread.expanded = true;
++                this.general_threads.push(thread);
++                this.show_review_toast(format!("Started a thread on !{iid}"), cx);
++                this.read_threads_again(window, cx);
++            },
++        );
++    }
++
++    /// Opens the reply box on the thread, or moves to the one already open.
++    fn reply_to_general_thread(
++        &mut self,
++        discussion_id: &str,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let Some(shown) = self
++            .general_thread_mut(discussion_id)
++            .map(|thread| thread.reply.clone())
++        else {
++            return;
++        };
++        let editor = match shown {
++            Some(editor) => editor,
++            None => {
++                let editor = cx.new(|cx| {
++                    let mut editor = Editor::auto_height(1, 8, window, cx);
++                    editor.set_placeholder_text("Reply…", window, cx);
++                    editor
++                });
++                if let Some(thread) = self.general_thread_mut(discussion_id) {
++                    thread.reply = Some(editor.clone());
++                }
++                editor
++            }
++        };
++        let focus_handle = editor.focus_handle(cx);
++        window.focus(&focus_handle, cx);
++        cx.notify();
++    }
++
++    fn cancel_general_reply(&mut self, discussion_id: &str, cx: &mut Context<Self>) {
++        if let Some(thread) = self.general_thread_mut(discussion_id) {
++            thread.reply = None;
++            cx.notify();
++        }
++    }
++
++    /// Sends the text in the thread's reply box. The box and its text stay
++    /// if GitLab refuses.
++    fn send_general_reply(
++        &mut self,
++        discussion_id: String,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if self.general_thread_busy {
++            return;
++        }
++        let Some(editor) = self
++            .general_thread_mut(&discussion_id)
++            .and_then(|thread| thread.reply.clone())
++        else {
++            return;
++        };
++        let body = editor.read(cx).text(cx).trim().to_string();
++        if body.is_empty() {
++            return;
++        }
++        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
++            return;
++        };
++        let request = cx.background_spawn(gitlab_review::reply_to_discussion(
++            work_dir,
++            iid,
++            discussion_id.clone(),
++            body,
++        ));
++        self.run_general_thread_request(
++            request,
++            "Could not send the reply",
++            window,
++            cx,
++            move |this, note, window, cx| {
++                let note = this.general_note(note, cx);
++                if let Some(thread) = this.general_thread_mut(&discussion_id) {
++                    thread.notes.push(note);
++                    thread.reply = None;
++                }
++                this.read_threads_again(window, cx);
++            },
++        );
++    }
++
++    /// Resolves or reopens the thread on GitLab, then shows it so.
++    fn resolve_general_thread(
++        &mut self,
++        discussion_id: String,
++        resolved: bool,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if self.general_thread_busy {
++            return;
++        }
++        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
++            return;
++        };
++        let request = cx.background_spawn(gitlab_review::resolve_discussion(
++            work_dir,
++            iid,
++            discussion_id.clone(),
++            resolved,
++        ));
++        self.run_general_thread_request(
++            request,
++            "Could not change the thread's resolved state",
++            window,
++            cx,
++            move |this, (), window, cx| {
++                if let Some(thread) = this.general_thread_mut(&discussion_id) {
++                    thread.resolved = resolved;
++                }
++                this.read_threads_again(window, cx);
++            },
++        );
++    }
++
++    /// Runs one request about a thread on the merge request itself, with
++    /// the buttons held until GitLab answers.
++    fn run_general_thread_request<T: 'static>(
++        &mut self,
++        request: Task<Result<T>>,
++        failure: &'static str,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++        on_success: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
++    ) {
++        self.general_thread_busy = true;
++        cx.notify();
++        self._general_thread_task = Some(cx.spawn_in(window, async move |this, cx| {
++            let result = request.await;
++            this.update_in(cx, |this, window, cx| {
++                this.general_thread_busy = false;
++                match result {
++                    Ok(value) => on_success(this, value, window, cx),
++                    Err(error) => this.show_workspace_error(format!("{failure}: {error:#}"), cx),
++                }
++                cx.notify();
++            })
++            .ok();
++        }));
++    }
++
++    /// Reads the threads from GitLab afresh after a change made here. A
++    /// read that began before the change would put the old state back, so
++    /// any in flight is dropped first.
++    fn read_threads_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        self.prefetched_discussions.take();
++        self.sync_review_threads(window, cx);
++    }
++
+     /// Asks the model for a reply to the thread under `comment_id` and puts
+     /// it in the reply box for editing.
+     fn draft_review_reply(
+@@ -1901,6 +2614,46 @@ impl DiffMultibuffer {
+         });
+     }
+ 
++    /// Shows a merge request above the diff without asking GitLab for it.
++    #[cfg(test)]
++    pub(crate) fn show_merge_request_for_test(&mut self, cx: &mut Context<Self>) {
++        self.merge_request = Some(MergeRequestHeader {
++            iid: 7,
++            title: "A change".into(),
++            author: "Ada".into(),
++            web_url: "https://gitlab.example/group/project/-/merge_requests/7".into(),
++            project_path: None,
++            head_sha: None,
++            description: None,
++            description_text: None,
++            expanded: true,
++            description_height: None,
++            description_drag: None,
++            related_issues: Vec::new(),
++            approvals: None,
++            reviewer: None,
++            last_review: None,
++        });
++        cx.notify();
++    }
++
++    /// Each thread on the merge request itself: its id, whether it is
++    /// resolved, whether it is shown in full, and its notes' texts.
++    #[cfg(test)]
++    pub(crate) fn general_threads_for_test(&self) -> Vec<(String, bool, bool, Vec<String>)> {
++        self.general_threads
++            .iter()
++            .map(|thread| {
++                (
++                    thread.discussion_id.clone(),
++                    thread.resolved,
++                    thread.expanded,
++                    thread.notes.iter().map(|note| note.body.clone()).collect(),
++                )
++            })
++            .collect()
++    }
++
+     #[cfg(any(test, feature = "test-support"))]
+     pub(crate) fn review_order_block_count(&self) -> usize {
+         self.review_order_blocks.len()
+@@ -2034,9 +2787,10 @@ impl DiffMultibuffer {
+         };
+         self._review_threads_task = Some(cx.spawn_in(window, async move |this, cx| {
+             match fetch.await {
+-                Ok(discussions) => {
++                Ok(threads) => {
+                     this.update_in(cx, |this, window, cx| {
+-                        this.apply_remote_discussions(discussions, window, cx)
++                        this.apply_remote_discussions(threads.on_lines, window, cx);
++                        this.apply_general_threads(threads.general, cx);
+                     })
+                     .ok();
+                 }
+@@ -3429,6 +4183,19 @@ fn render_review_note(
+         .into_any_element()
+ }
+ 
++/// The first line of a note, cut short, for a thread folded to one line.
++fn preview_of(body: &str) -> String {
++    let first_line = body.lines().next().unwrap_or_default().trim();
++    let mut preview: String = first_line
++        .chars()
++        .take(GENERAL_THREAD_PREVIEW_CHARS)
++        .collect();
++    if first_line.chars().count() > GENERAL_THREAD_PREVIEW_CHARS {
++        preview.push('…');
++    }
++    preview
++}
++
+ /// Seconds since the Unix epoch for one of GitLab's ISO 8601 timestamps.
+ fn parse_timestamp(text: &str) -> Option<i64> {
+     time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+diff --git a/crates/git_ui/src/gitlab_review.rs b/crates/git_ui/src/gitlab_review.rs
+index f7aafb74c2..4ac31adf1b 100644
+--- a/crates/git_ui/src/gitlab_review.rs
++++ b/crates/git_ui/src/gitlab_review.rs
+@@ -292,6 +292,26 @@ pub struct RemoteNote {
+     pub body: String,
+ }
+ 
++/// A thread on the merge request itself, not on a line of its diff. Unlike
++/// a plain comment it can be resolved, and while open it can block the merge.
++#[derive(Clone, Debug, PartialEq)]
++pub struct GeneralDiscussion {
++    pub id: String,
++    pub resolved: bool,
++    /// When the thread was opened, as GitLab's ISO 8601 timestamp.
++    pub created_at: Option<String>,
++    /// The opening note first, then the replies, without system notes.
++    pub notes: Vec<RemoteNote>,
++}
++
++/// The threads of a merge request: the ones on lines of its diff, and the
++/// ones on the merge request itself.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct RemoteThreads {
++    pub on_lines: Vec<RemoteDiscussion>,
++    pub general: Vec<GeneralDiscussion>,
++}
++
+ /// Replaces the text of the note `note_id` on thread `discussion_id`.
+ pub async fn update_note(
+     work_dir: PathBuf,
+@@ -357,6 +377,34 @@ pub async fn post_note(work_dir: PathBuf, iid: u64, body: String) -> Result<()>
+     Ok(())
+ }
+ 
++/// Starts a thread on the merge request itself, not on a line, with `body`
++/// as its opening note, and returns the thread as GitLab stored it.
++pub async fn start_discussion(
++    work_dir: PathBuf,
++    iid: u64,
++    body: String,
++) -> Result<GeneralDiscussion> {
++    let endpoint = format!("projects/:id/merge_requests/{iid}/discussions");
++    let request = json!({ "body": body }).to_string();
++    let reply = glab_api(&work_dir, "POST", &endpoint, Some(&request)).await?;
++    parse_started_discussion(&reply)
++}
++
++fn parse_started_discussion(text: &str) -> Result<GeneralDiscussion> {
++    let discussion: RawDiscussion =
++        serde_json::from_str(text).context("the discussion reply is not the expected JSON")?;
++    let notes = discussion.notes();
++    let first = notes
++        .first()
++        .context("GitLab replied with a thread that has no note")?;
++    Ok(GeneralDiscussion {
++        resolved: first.resolved,
++        created_at: first.created_at.clone(),
++        notes: notes.iter().map(|note| note.remote()).collect(),
++        id: discussion.id,
++    })
++}
++
+ /// Gives or withdraws the current user's approval.
+ pub async fn set_approval(work_dir: PathBuf, iid: u64, approve: bool) -> Result<()> {
+     let action = if approve { "approve" } else { "unapprove" };
+@@ -494,126 +542,205 @@ pub async fn fetch_related_issues(work_dir: PathBuf, iid: u64) -> Result<Vec<Rel
+     serde_json::from_str(&text).context("the related issues reply is not the expected JSON")
+ }
+ 
+-/// The threads on the diff of merge request `iid`, resolved ones included.
+-pub async fn fetch_discussions(work_dir: PathBuf, iid: u64) -> Result<Vec<RemoteDiscussion>> {
+-    let endpoint = format!("projects/:id/merge_requests/{iid}/discussions?per_page=100");
+-    let text = glab_api(&work_dir, "GET", &endpoint, None).await?;
+-    parse_discussions(&text)
++/// How many discussions GitLab is asked for at a time.
++const DISCUSSIONS_PER_PAGE: usize = 100;
++/// Far more pages than a merge request has; stops a listing that never ends.
++const MAX_DISCUSSION_PAGES: usize = 50;
++
++/// The threads of merge request `iid`, resolved ones included. Every page
++/// is read: each system note, such as a push, is a discussion of its own, so
++/// a busy merge request passes one page well before it has that many threads,
++/// and the newest threads are on the last page.
++pub async fn fetch_discussions(work_dir: PathBuf, iid: u64) -> Result<RemoteThreads> {
++    let discussions = read_every_page(DISCUSSIONS_PER_PAGE, |page| {
++        let work_dir = work_dir.clone();
++        async move {
++            let endpoint = format!(
++                "projects/:id/merge_requests/{iid}/discussions?per_page={DISCUSSIONS_PER_PAGE}&page={page}"
++            );
++            let text = glab_api(&work_dir, "GET", &endpoint, None).await?;
++            parse_discussion_page(&text)
++        }
++    })
++    .await?;
++    Ok(threads_from(discussions))
+ }
+ 
+-fn parse_discussions(text: &str) -> Result<Vec<RemoteDiscussion>> {
+-    #[derive(Deserialize)]
+-    struct RawDiscussion {
+-        id: String,
+-        #[serde(default)]
+-        notes: Vec<RawNote>,
+-    }
+-    #[derive(Deserialize)]
+-    struct RawNote {
+-        #[serde(default)]
+-        id: Option<u64>,
+-        #[serde(default)]
+-        body: String,
+-        #[serde(default)]
+-        system: bool,
+-        #[serde(default)]
+-        resolved: bool,
+-        #[serde(default)]
+-        author: Option<Author>,
+-        #[serde(default)]
+-        created_at: Option<String>,
+-        #[serde(default)]
+-        position: Option<RawPosition>,
+-    }
+-    #[derive(Deserialize)]
+-    struct RawPosition {
+-        #[serde(default)]
+-        new_path: Option<String>,
+-        #[serde(default)]
+-        old_path: Option<String>,
+-        #[serde(default)]
+-        new_line: Option<u32>,
+-        #[serde(default)]
+-        old_line: Option<u32>,
+-        #[serde(default)]
+-        head_sha: Option<String>,
+-        #[serde(default)]
+-        line_range: Option<RawLineRange>,
+-    }
+-    #[derive(Deserialize)]
+-    struct RawLineRange {
+-        #[serde(default)]
+-        start: Option<RawLineReference>,
++/// Reads a listing page by page, from page one, until a page comes back
++/// short of `per_page` items.
++async fn read_every_page<T, Page>(
++    per_page: usize,
++    read_page: impl Fn(usize) -> Page,
++) -> Result<Vec<T>>
++where
++    Page: Future<Output = Result<Vec<T>>>,
++{
++    let mut items = Vec::new();
++    for page in 1..=MAX_DISCUSSION_PAGES {
++        let listed = read_page(page).await?;
++        let last_page = listed.len() < per_page;
++        items.extend(listed);
++        if last_page {
++            break;
++        }
+     }
+-    #[derive(Deserialize)]
+-    struct RawLineReference {
+-        #[serde(default)]
+-        new_line: Option<u32>,
+-        #[serde(default)]
+-        old_line: Option<u32>,
++    Ok(items)
++}
++
++#[derive(Deserialize)]
++struct RawDiscussion {
++    id: String,
++    /// A plain comment, which is not a thread and cannot be resolved.
++    #[serde(default)]
++    individual_note: bool,
++    #[serde(default)]
++    notes: Vec<RawNote>,
++}
++
++impl RawDiscussion {
++    /// The notes people wrote, without the system's.
++    fn notes(&self) -> Vec<&RawNote> {
++        self.notes.iter().filter(|note| !note.system).collect()
+     }
++}
+ 
+-    let raw: Vec<RawDiscussion> =
+-        serde_json::from_str(text).context("the discussion list is not the expected JSON")?;
+-    Ok(raw
+-        .into_iter()
+-        .filter_map(|discussion| {
+-            let notes: Vec<&RawNote> = discussion
+-                .notes
+-                .iter()
+-                .filter(|note| !note.system)
+-                .collect();
+-            let first = notes.first()?;
+-            let position = first.position.as_ref()?;
+-            let range_start = position
+-                .line_range
++#[derive(Deserialize)]
++struct RawNote {
++    #[serde(default)]
++    id: Option<u64>,
++    #[serde(default)]
++    body: String,
++    #[serde(default)]
++    system: bool,
++    #[serde(default)]
++    resolved: bool,
++    #[serde(default)]
++    author: Option<Author>,
++    #[serde(default)]
++    created_at: Option<String>,
++    #[serde(default)]
++    position: Option<RawPosition>,
++}
++
++impl RawNote {
++    fn remote(&self) -> RemoteNote {
++        RemoteNote {
++            id: self.id,
++            author: self
++                .author
+                 .as_ref()
+-                .and_then(|range| range.start.as_ref());
+-            // A thread on a line the change kept or added has a new line; one
+-            // on a removed line has only an old line.
+-            let (path, line, start_line, old_side) = match (position.new_line, position.old_line) {
+-                (Some(line), _) => (
+-                    position.new_path.clone()?,
++                .map(|author| author.name.clone())
++                .unwrap_or_default(),
++            body: self.body.clone(),
++        }
++    }
++}
++
++#[derive(Deserialize)]
++struct RawPosition {
++    #[serde(default)]
++    new_path: Option<String>,
++    #[serde(default)]
++    old_path: Option<String>,
++    #[serde(default)]
++    new_line: Option<u32>,
++    #[serde(default)]
++    old_line: Option<u32>,
++    #[serde(default)]
++    head_sha: Option<String>,
++    #[serde(default)]
++    line_range: Option<RawLineRange>,
++}
++
++#[derive(Deserialize)]
++struct RawLineRange {
++    #[serde(default)]
++    start: Option<RawLineReference>,
++}
++
++#[derive(Deserialize)]
++struct RawLineReference {
++    #[serde(default)]
++    new_line: Option<u32>,
++    #[serde(default)]
++    old_line: Option<u32>,
++}
++
++fn parse_discussion_page(text: &str) -> Result<Vec<RawDiscussion>> {
++    serde_json::from_str(text).context("the discussion list is not the expected JSON")
++}
++
++#[cfg(test)]
++fn parse_discussions(text: &str) -> Result<RemoteThreads> {
++    Ok(threads_from(parse_discussion_page(text)?))
++}
++
++/// Sorts the discussions into threads on lines and threads on the merge
++/// request itself. Plain comments and system notes are neither.
++fn threads_from(discussions: Vec<RawDiscussion>) -> RemoteThreads {
++    let mut threads = RemoteThreads::default();
++    for discussion in discussions {
++        let notes = discussion.notes();
++        let Some(first) = notes.first() else {
++            continue;
++        };
++        let Some(position) = first.position.as_ref() else {
++            if !discussion.individual_note {
++                threads.general.push(GeneralDiscussion {
++                    id: discussion.id.clone(),
++                    resolved: first.resolved,
++                    created_at: first.created_at.clone(),
++                    notes: notes.iter().map(|note| note.remote()).collect(),
++                });
++            }
++            continue;
++        };
++        let range_start = position
++            .line_range
++            .as_ref()
++            .and_then(|range| range.start.as_ref());
++        // A thread on a line the change kept or added has a new line; one
++        // on a removed line has only an old line.
++        let placed = match (position.new_line, position.old_line) {
++            (Some(line), _) => position.new_path.clone().map(|path| {
++                (
++                    path,
+                     line,
+                     range_start.and_then(|start| start.new_line),
+                     false,
+-                ),
+-                (None, Some(line)) => (
+-                    position
+-                        .old_path
+-                        .clone()
+-                        .or_else(|| position.new_path.clone())?,
+-                    line,
+-                    range_start.and_then(|start| start.old_line),
+-                    true,
+-                ),
+-                (None, None) => return None,
+-            };
+-            let start_line = start_line.unwrap_or(line).min(line);
+-            Some(RemoteDiscussion {
+-                id: discussion.id,
+-                path,
+-                start_line,
+-                line,
+-                old_side,
+-                resolved: first.resolved,
+-                head_sha: position.head_sha.clone(),
+-                created_at: first.created_at.clone(),
+-                notes: notes
+-                    .into_iter()
+-                    .map(|note| RemoteNote {
+-                        id: note.id,
+-                        author: note
+-                            .author
+-                            .as_ref()
+-                            .map(|author| author.name.clone())
+-                            .unwrap_or_default(),
+-                        body: note.body.clone(),
+-                    })
+-                    .collect(),
+-            })
+-        })
+-        .collect())
++                )
++            }),
++            (None, Some(line)) => position
++                .old_path
++                .clone()
++                .or_else(|| position.new_path.clone())
++                .map(|path| {
++                    (
++                        path,
++                        line,
++                        range_start.and_then(|start| start.old_line),
++                        true,
++                    )
++                }),
++            (None, None) => None,
++        };
++        let Some((path, line, start_line, old_side)) = placed else {
++            continue;
++        };
++        let start_line = start_line.unwrap_or(line).min(line);
++        threads.on_lines.push(RemoteDiscussion {
++            id: discussion.id.clone(),
++            path,
++            start_line,
++            line,
++            old_side,
++            resolved: first.resolved,
++            head_sha: position.head_sha.clone(),
++            created_at: first.created_at.clone(),
++            notes: notes.iter().map(|note| note.remote()).collect(),
++        });
++    }
++    threads
+ }
+ 
+ async fn find_merge_request(work_dir: &Path, branch: &str) -> Result<MergeRequest> {
+@@ -1156,7 +1283,16 @@ index 1111111..2222222 100644
+             {"body": "changed status", "system": true, "author": {"name": "GitLab"}},
+             {"body": "Because.", "author": {"name": "Bob"}}
+           ]},
+-          {"id": "general", "notes": [{"body": "Nice work", "author": {"name": "Ada"}}]},
++          {"id": "comment", "individual_note": true,
++            "notes": [{"body": "Nice work", "author": {"name": "Ada"}}]},
++          {"id": "general", "individual_note": false, "notes": [
++            {"id": 9, "body": "Is there a recording?", "resolved": true, "author": {"name": "Ada"},
++              "created_at": "2026-10-20T09:00:00.000Z"},
++            {"body": "resolved all threads", "system": true, "author": {"name": "GitLab"}},
++            {"body": "Added one.", "author": {"name": "Bob"}}
++          ]},
++          {"id": "system", "individual_note": true,
++            "notes": [{"body": "added 2 commits", "system": true, "author": {"name": "Bob"}}]},
+           {"id": "resolved", "notes": [{"body": "Done", "resolved": true, "author": {"name": "Ada"},
+             "position": {"new_path": "src/b.rs", "new_line": 3}}]},
+           {"id": "old-side", "notes": [{"body": "Removed", "author": {"name": "Ada"},
+@@ -1164,10 +1300,32 @@ index 1111111..2222222 100644
+             "line_range": {"start": {"old_line": 5}, "end": {"old_line": 7}}}}]}
+         ]"#;
+ 
+-        let discussions = parse_discussions(text).unwrap();
++        let threads = parse_discussions(text).unwrap();
+ 
++        // A thread on the merge request itself is kept apart from the ones
++        // on lines; a plain comment and a system note are not threads.
++        assert_eq!(
++            threads.general,
++            vec![GeneralDiscussion {
++                id: "general".into(),
++                resolved: true,
++                created_at: Some("2026-10-20T09:00:00.000Z".into()),
++                notes: vec![
++                    RemoteNote {
++                        id: Some(9),
++                        author: "Ada".into(),
++                        body: "Is there a recording?".into(),
++                    },
++                    RemoteNote {
++                        id: None,
++                        author: "Bob".into(),
++                        body: "Added one.".into(),
++                    },
++                ],
++            }]
++        );
+         assert_eq!(
+-            discussions,
++            threads.on_lines,
+             vec![
+                 RemoteDiscussion {
+                     id: "d1".into(),
+@@ -1225,6 +1383,55 @@ index 1111111..2222222 100644
+         );
+     }
+ 
++    #[test]
++    fn a_started_thread_reads_back_as_gitlab_stored_it() {
++        let reply = r#"{"id": "t1", "individual_note": false, "notes": [
++          {"id": 41, "type": "DiscussionNote", "body": "Where is the test?", "resolvable": true,
++            "resolved": false, "author": {"name": "Jack"}, "created_at": "2026-11-11T10:00:00.000Z"}
++        ]}"#;
++
++        assert_eq!(
++            parse_started_discussion(reply).unwrap(),
++            GeneralDiscussion {
++                id: "t1".into(),
++                resolved: false,
++                created_at: Some("2026-11-11T10:00:00.000Z".into()),
++                notes: vec![RemoteNote {
++                    id: Some(41),
++                    author: "Jack".into(),
++                    body: "Where is the test?".into(),
++                }],
++            }
++        );
++        assert!(parse_started_discussion(r#"{"id": "t2", "notes": []}"#).is_err());
++    }
++
++    /// The newest threads are on the last page, so stopping at the first
++    /// would hide exactly the ones just written.
++    #[test]
++    fn a_listing_is_read_to_its_last_page() {
++        let read = |total: usize| {
++            let asked = std::cell::RefCell::new(Vec::new());
++            let items = futures::executor::block_on(read_every_page(3, |page| {
++                asked.borrow_mut().push(page);
++                let start = (page - 1) * 3;
++                async move { Ok((start..total.min(start + 3)).collect::<Vec<usize>>()) }
++            }))
++            .unwrap();
++            (items, asked.into_inner())
++        };
++
++        assert_eq!(read(7), ((0..7).collect::<Vec<_>>(), vec![1, 2, 3]));
++        assert_eq!(read(2), (vec![0, 1], vec![1]));
++        // A last page that is exactly full needs one more look.
++        assert_eq!(read(6), ((0..6).collect::<Vec<_>>(), vec![1, 2, 3]));
++        assert_eq!(read(0), (Vec::new(), vec![1]));
++
++        let failed: Result<Vec<usize>> =
++            futures::executor::block_on(read_every_page(3, |_| async { bail!("offline") }));
++        assert!(failed.is_err());
++    }
++
+     #[test]
+     fn project_path_comes_off_the_web_url() {
+         assert_eq!(
+diff --git a/crates/git_ui/src/project_diff.rs b/crates/git_ui/src/project_diff.rs
+index 266ac62845..70aadb86ed 100644
+--- a/crates/git_ui/src/project_diff.rs
++++ b/crates/git_ui/src/project_diff.rs
+@@ -74,6 +74,10 @@ actions!(
+         /// Opens the box for the summary comment that finishes the review,
+         /// with approve and request changes buttons.
+         FinishReview,
++        /// Opens the box for a thread on the merge request itself, not on a
++        /// line. Unlike the summary comment, a thread stays open until it is
++        /// resolved.
++        StartMergeRequestThread,
+         /// Approves the merge request, or withdraws the approval.
+         ApproveMergeRequest,
+         /// Folds the merge request description above the diff, or unfolds it.
+@@ -679,6 +683,16 @@ impl ProjectDiff {
+             .update(cx, |diff, cx| diff.toggle_review_summary(window, cx));
+     }
+ 
++    fn start_merge_request_thread(
++        &mut self,
++        _: &StartMergeRequestThread,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.diff
++            .update(cx, |diff, cx| diff.start_general_thread(window, cx));
++    }
++
+     fn approve_merge_request(
+         &mut self,
+         _: &ApproveMergeRequest,
+@@ -755,6 +769,7 @@ impl Render for ProjectDiff {
+             .on_action(cx.listener(Self::post_review_to_gitlab))
+             .on_action(cx.listener(Self::refresh_review_threads))
+             .on_action(cx.listener(Self::finish_review))
++            .on_action(cx.listener(Self::start_merge_request_thread))
+             .on_action(cx.listener(Self::approve_merge_request))
+             .on_action(cx.listener(Self::mark_reviewed))
+             .on_action(cx.listener(Self::toggle_merge_request_description))
+-- 
+2.54.0 (Apple Git-157)
+

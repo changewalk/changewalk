@@ -1,7 +1,7 @@
 From 0dbc9c77a788355e6c66cd325695b50e9f06e8c1 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Thu, 5 Nov 2026 15:46:56 +0000
-Subject: [PATCH 3/6] Fold posted threads to chips, add comment editing, a
+Subject: [PATCH 3/7] Fold posted threads to chips, add comment editing, a
  comments menu, streamed notes, cached-order fast path and squash-safe bases
 
 ---

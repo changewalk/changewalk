@@ -107,7 +107,9 @@ and `changewalk --onboard` asks again; `--app` or the saved app-bundle path
 overrides the one onboarding found.
 
 Zed shows the whole review: the diff in reading order, guiding notes, the
-description, and the review threads under their lines. VS Code and Cursor show
+description, and the review threads under their lines. Threads on the merge
+request itself, with no line, show under the description, where you can start
+one too. VS Code and Cursor show
 an ordered multi-file diff with the description beside it; the reading order,
 notes, and threads are on their way to them from the CLI.
 
