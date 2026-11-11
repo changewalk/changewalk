@@ -1,7 +1,7 @@
 From 655af8f61b646508b0ff19606a1969118763626c Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Wed, 11 Nov 2026 16:59:17 +0000
-Subject: [PATCH 8/8] git_ui: Say when each review note was written
+Subject: [PATCH 8/9] git_ui: Say when each review note was written
 
 A thread showed who wrote each note but not when, so an old remark and
 one from a minute ago read the same. The note's time from GitLab now

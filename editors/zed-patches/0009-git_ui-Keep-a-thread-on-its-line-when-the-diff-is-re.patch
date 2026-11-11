@@ -1,0 +1,325 @@
+From 032b674851ad878aae4fa10edd0ccfc245673e01 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Wed, 11 Nov 2026 17:35:28 +0000
+Subject: [PATCH 9/9] git_ui: Keep a thread on its line when the diff is
+ re-sorted
+
+A thread read from GitLab started at a left-leaning anchor at the head
+of its line. Lines the change removed are drawn at that same place in
+the file, so the anchor sat at the top of them, and read back off the
+screen it was a line of the old file. A re-sort lifts the comments out
+by line and puts them back, so a thread on the first line after removed
+lines went back on another line, or was dropped when the diff did not
+show that line. The reading order arrives a few seconds after the
+threads, so this happened on most opens.
+
+The start now leans right, onto the line itself, and a held comment's
+rows are read from its anchor in the file rather than off the screen.
+A comment whose lines the diff no longer shows is kept at the nearest
+shown line of its file instead of dropped, and the comments list names
+the line in the file too.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/editor/src/git.rs              |  11 ++-
+ crates/git_ui/src/diff_multibuffer.rs |  54 ++++++++---
+ crates/git_ui/src/project_diff.rs     | 126 +++++++++++++++++++++++++-
+ 3 files changed, 172 insertions(+), 19 deletions(-)
+
+diff --git a/crates/editor/src/git.rs b/crates/editor/src/git.rs
+index 588d8aa2e6..6a0b891c6a 100644
+--- a/crates/editor/src/git.rs
++++ b/crates/editor/src/git.rs
+@@ -1315,11 +1315,12 @@ impl Editor {
+         cx: &mut Context<Self>,
+     ) -> Vec<ReviewCommentRecord> {
+         let snapshot = self.buffer.read(cx).snapshot(cx);
+-        let buffer_row = |anchor: &Anchor| {
+-            let point = anchor.to_point(&snapshot);
+-            snapshot
+-                .point_to_buffer_point(point)
+-                .map_or(point.row, |(_, buffer_point)| buffer_point.row)
++        // The row in the file itself. Read off the screen, a place among
++        // removed lines is a row of the old file, and the comment would go
++        // back on another line, or on none.
++        let buffer_row = |anchor: &Anchor| match snapshot.anchor_to_buffer_anchor(*anchor) {
++            Some((anchor, buffer)) => anchor.to_point(buffer).row,
++            None => anchor.to_point(&snapshot).row,
+         };
+         let records: Vec<ReviewCommentRecord> = self
+             .stored_review_comments
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index 84e8e1a52c..b1192084d9 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -2846,8 +2846,8 @@ impl DiffMultibuffer {
+         }));
+     }
+ 
+-    /// Puts the comments held over a re-sort back under their lines. A
+-    /// comment whose lines the diff no longer shows is dropped.
++    /// Puts the comments held over a re-sort back under their lines. Only a
++    /// comment on a file the diff no longer has is dropped.
+     fn restore_held_review_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+         if self.held_review_comments.is_empty() {
+             return;
+@@ -2869,24 +2869,47 @@ impl DiffMultibuffer {
+             .update(cx, |editor, cx| {
+                 for record in records {
+                     let Some(buffer) = buffers_by_file.get(&record.file_path) else {
++                        log::warn!(
++                            "dropping a review comment on {}:{}, a file the diff no longer shows",
++                            record.file_path.as_unix_str(),
++                            record.end_row + 1
++                        );
+                         continue;
+                     };
+-                    let Some(range) =
+-                        anchor_range_for_rows(&snapshot, buffer, record.start_row, record.end_row)
+-                    else {
++                    // A comment whose lines the diff no longer shows is kept
++                    // at the nearest shown line of its file, and a thread
++                    // says where it was, as one read from GitLab does.
++                    let shown =
++                        anchor_range_for_rows(&snapshot, buffer, record.start_row, record.end_row);
++                    let moved = shown.is_none();
++                    let Some(range) = shown.or_else(|| {
++                        let row = nearest_shown_row(&snapshot, buffer, record.end_row)?;
++                        anchor_range_for_rows(&snapshot, buffer, row, row)
++                    }) else {
+                         log::warn!(
+-                            "dropping a review comment on {}:{} that the diff no longer shows",
++                            "dropping a review comment on {}:{}, a file the diff shows none of",
+                             record.file_path.as_unix_str(),
+-                            record.start_row + 1
++                            record.end_row + 1
+                         );
+                         continue;
+                     };
++                    let mut thread = record.thread;
++                    if moved {
++                        log::warn!(
++                            "the diff no longer shows {}:{}; its review comment is at the nearest shown line",
++                            record.file_path.as_unix_str(),
++                            record.end_row + 1
++                        );
++                        if let Some(thread) = thread.as_mut() {
++                            thread.original_line.get_or_insert(record.end_row + 1);
++                        }
++                    }
+                     editor.add_review_comment_at(
+                         record.file_path,
+                         range,
+                         record.text,
+                         record.author,
+-                        record.thread,
++                        thread,
+                         window,
+                         cx,
+                     );
+@@ -2894,7 +2917,7 @@ impl DiffMultibuffer {
+             });
+     }
+ 
+-    fn apply_remote_discussions(
++    pub(crate) fn apply_remote_discussions(
+         &mut self,
+         discussions: Vec<RemoteDiscussion>,
+         window: &mut Window,
+@@ -3324,9 +3347,11 @@ impl DiffMultibuffer {
+             .into_iter()
+             .map(|comment| {
+                 let start = comment.range.start.to_point(&snapshot);
++                // The line in the file itself. Read off the screen, a place
++                // among removed lines is a line of the old file.
+                 let line = snapshot
+-                    .point_to_buffer_point(start)
+-                    .map_or(start.row, |(_, point)| point.row)
++                    .anchor_to_buffer_anchor(comment.range.start)
++                    .map_or(start.row, |(anchor, buffer)| anchor.to_point(buffer).row)
+                     + 1;
+                 let first_line = comment.text.lines().next().unwrap_or_default().trim();
+                 let snippet: String = first_line.chars().take(70).collect();
+@@ -4140,6 +4165,11 @@ impl Render for DiffMultibuffer {
+ 
+ /// Multibuffer anchors from the start of `start_row` to the end of `end_row`
+ /// in `buffer`, if the diff shows those lines.
++///
++/// The start leans right, onto the line itself. Lines the change removed
++/// are drawn at that same place in the file, just above the line, and a
++/// start that leaned left would sit at the top of them: read back off the
++/// screen it is then a line of the old file, not this one.
+ fn anchor_range_for_rows(
+     snapshot: &multi_buffer::MultiBufferSnapshot,
+     buffer: &language::BufferSnapshot,
+@@ -4149,7 +4179,7 @@ fn anchor_range_for_rows(
+     let max_row = buffer.max_point().row;
+     let start_row = start_row.min(max_row);
+     let end_row = end_row.min(max_row).max(start_row);
+-    let start = snapshot.anchor_in_excerpt(buffer.anchor_before(Point::new(start_row, 0)))?;
++    let start = snapshot.anchor_in_excerpt(buffer.anchor_after(Point::new(start_row, 0)))?;
+     let end = snapshot
+         .anchor_in_excerpt(buffer.anchor_before(Point::new(end_row, buffer.line_len(end_row))))?;
+     Some(start..end)
+diff --git a/crates/git_ui/src/project_diff.rs b/crates/git_ui/src/project_diff.rs
+index 70aadb86ed..ee528b9c8e 100644
+--- a/crates/git_ui/src/project_diff.rs
++++ b/crates/git_ui/src/project_diff.rs
+@@ -2721,6 +2721,120 @@ mod tests {
+         assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+     }
+ 
++    /// A thread on the first line after removed lines must keep its line
++    /// through a re-sort. The removed lines are drawn right above it, and
++    /// reading its place off the screen there gives a line of the old file,
++    /// which is another line as soon as anything above was added or removed.
++    #[gpui::test]
++    async fn test_a_thread_under_removed_lines_survives_a_re_sort(cx: &mut TestAppContext) {
++        use crate::gitlab_review::{RemoteDiscussion, RemoteNote};
++        use crate::review_order::{ReviewOrder, ReviewOrderEntry};
++        use git::repository::repo_path;
++
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({
++                ".git": {},
++                "a.rs": "added\nadded too\none\ntwo, reworded\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
++                "b.rs": "B\n",
++            }),
++        )
++        .await;
++        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        let diff = cx.new_window_entity(|window, cx| {
++            ProjectDiff::new(project.clone(), workspace, window, cx)
++        });
++        cx.run_until_parked();
++
++        // Two lines were added at the top, and three old lines became the
++        // one line `two, reworded`, which is line 4 now and was line 2.
++        fs.set_head_and_index_for_repo(
++            path!("/project/.git").as_ref(),
++            &[
++                (
++                    "a.rs",
++                    "one\ntwo\nremoved\nalso removed\nthree\nfour\nfive\nsix\nseven\neight\nnine\n"
++                        .into(),
++                ),
++                ("b.rs", "b\n".into()),
++            ],
++        );
++        cx.run_until_parked();
++
++        let thread = |id: &str, line: u32| RemoteDiscussion {
++            id: id.into(),
++            path: "a.rs".into(),
++            start_line: line,
++            line,
++            old_side: false,
++            resolved: false,
++            head_sha: None,
++            created_at: None,
++            notes: vec![RemoteNote {
++                id: None,
++                author: "Ada".into(),
++                body: format!("On line {line}."),
++                created_at: None,
++            }],
++        };
++        diff.update_in(cx, |diff, window, cx| {
++            diff.diff.update(cx, |diff, cx| {
++                diff.apply_remote_discussions(
++                    vec![thread("under", 4), thread("below", 5)],
++                    window,
++                    cx,
++                )
++            })
++        });
++        cx.run_until_parked();
++
++        // Each thread's line in the new version of the file, one-based.
++        let editor = diff.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
++        let thread_lines = |cx: &mut gpui::VisualTestContext| {
++            let mut lines = editor.read_with(cx, |editor, cx| {
++                let snapshot = editor.buffer().read(cx).snapshot(cx);
++                editor
++                    .review_comments()
++                    .into_iter()
++                    .map(|comment| {
++                        let (anchor, buffer) = snapshot
++                            .anchor_to_buffer_anchor(comment.range.start)
++                            .expect("the thread is on a file in the diff");
++                        (
++                            comment.thread.expect("a remote thread").discussion_id,
++                            language::ToPoint::to_point(&anchor, buffer).row + 1,
++                        )
++                    })
++                    .collect::<Vec<_>>()
++            });
++            lines.sort();
++            lines
++        };
++        let placed = vec![("below".to_string(), 5), ("under".to_string(), 4)];
++        assert_eq!(thread_lines(cx), placed);
++
++        let order = ReviewOrder::new([ReviewOrderEntry {
++            path: repo_path("b.rs"),
++            reason: "Read this first.".into(),
++            notes: Vec::new(),
++        }]);
++        diff.update_in(cx, |diff, window, cx| {
++            diff.set_review_order(Some(Arc::new(order)), window, cx)
++        });
++        cx.run_until_parked();
++        assert_eq!(
++            diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx)),
++            vec!["b.rs", "a.rs"]
++        );
++        assert_eq!(thread_lines(cx), placed);
++    }
++
+     #[gpui::test]
+     async fn test_review_order_sorts_listed_files_first(cx: &mut TestAppContext) {
+         use crate::review_order::{ReviewNote, ReviewOrder, ReviewOrderEntry};
+@@ -2818,15 +2932,19 @@ mod tests {
+         // sit right under its header and are left out.
+         let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
+         assert_eq!(blocks, 2);
++        // The comment is still on the line `C` it was written on, not on
++        // the removed `c` drawn above it.
+         let comments = editor.read_with(cx, |editor, cx| {
+             let snapshot = editor.buffer().read(cx).snapshot(cx);
++            let text = snapshot.text();
+             editor
+                 .review_comments()
+                 .into_iter()
+                 .map(|comment| {
++                    let row = comment.range.start.to_point(&snapshot).row as usize;
+                     (
+                         comment.file_path.as_unix_str().to_string(),
+-                        comment.range.start.to_point(&snapshot).row,
++                        text.lines().nth(row).unwrap_or_default().to_string(),
+                         comment.text,
+                     )
+                 })
+@@ -2834,7 +2952,11 @@ mod tests {
+         });
+         assert_eq!(
+             comments,
+-            vec![("c.rs".to_string(), 0, "Check this.".to_string())]
++            vec![(
++                "c.rs".to_string(),
++                "C".to_string(),
++                "Check this.".to_string()
++            )]
+         );
+ 
+         // Clearing the order restores the path sort.
+-- 
+2.54.0 (Apple Git-157)
+
