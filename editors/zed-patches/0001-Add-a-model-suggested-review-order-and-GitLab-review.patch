@@ -1,7 +1,7 @@
 From 1dc4aea0b42740486c5c36ca91836b5f05593d21 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Thu, 15 Oct 2026 11:34:36 +0100
-Subject: [PATCH 1/7] Add a model-suggested review order and GitLab review flow
+Subject: [PATCH 1/8] Add a model-suggested review order and GitLab review flow
 
 ---
  Cargo.lock                                |   1 +

@@ -1,7 +1,7 @@
 From 5b18fb3204f6a10de99f5237a74bead23a0184f3 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Mon, 9 Nov 2026 18:38:16 +0000
-Subject: [PATCH 6/7] git_ui: Place review comments on the merge request's own
+Subject: [PATCH 6/8] git_ui: Place review comments on the merge request's own
  diff before posting
 
 GitLab takes a comment only on a line of its diff between base_sha and

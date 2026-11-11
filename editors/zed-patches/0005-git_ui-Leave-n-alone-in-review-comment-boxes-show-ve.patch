@@ -1,7 +1,7 @@
 From 66b8b14b24ad2f49265660d3b3cb2534f4a573c6 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Mon, 9 Nov 2026 17:50:38 +0000
-Subject: [PATCH 5/7] git_ui: Leave n alone in review comment boxes, show
+Subject: [PATCH 5/8] git_ui: Leave n alone in review comment boxes, show
  verdicts as they happen
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

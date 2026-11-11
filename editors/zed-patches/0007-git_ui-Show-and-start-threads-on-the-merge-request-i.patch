@@ -1,7 +1,7 @@
 From 1433ad823739fb2f2bd6b5408061bed249e11f07 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Wed, 11 Nov 2026 16:50:56 +0000
-Subject: [PATCH 7/7] git_ui: Show and start threads on the merge request
+Subject: [PATCH 7/8] git_ui: Show and start threads on the merge request
  itself
 
 A thread with no position on the diff was dropped when the threads were
