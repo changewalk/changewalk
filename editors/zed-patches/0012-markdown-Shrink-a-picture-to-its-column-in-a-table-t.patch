@@ -1,6 +1,6 @@
-From 66c6467cc8669814dc9e61724bc557c473ea886a Mon Sep 17 00:00:00 2001
+From 6d20cb9109fcb43578aa92617d0007bc1f042933 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
-Date: Sat, 14 Nov 2026 16:09:46 +0000
+Date: Sat, 14 Nov 2026 16:43:58 +0000
 Subject: [PATCH 12/12] markdown: Shrink a picture to its column in a table
  that fits its container
 
@@ -46,7 +46,7 @@ index 59afbbe800..7dddd705e8 100644
              before.size.width >= px(40.) && before.size.width < px(50.),
              "{before:?}"
 diff --git a/crates/markdown/src/markdown.rs b/crates/markdown/src/markdown.rs
-index 44e732c06c..01605a5a5b 100644
+index 44e732c06c..75662e234c 100644
 --- a/crates/markdown/src/markdown.rs
 +++ b/crates/markdown/src/markdown.rs
 @@ -1982,12 +1982,36 @@ impl MarkdownElement {
@@ -87,14 +87,14 @@ index 44e732c06c..01605a5a5b 100644
              let wrapper = if !self.style.prevent_mouse_interaction
                  && let Some(url) = enclosing_link_url
              {
-@@ -2029,6 +2053,7 @@ impl MarkdownElement {
+@@ -2028,6 +2052,7 @@ impl MarkdownElement {
+             };
              wrapper.child(
                  img(source)
-                     .id(("markdown-image", range.start))
 +                    .debug_selector(move || format!("markdown_image_content_{image_start}"))
+                     .id(("markdown-image", range.start))
                      .min_w_0()
                      .max_w_full()
-                     .rounded_md()
 @@ -6854,6 +6879,125 @@ mod tests {
          }
      }
