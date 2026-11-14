@@ -1,7 +1,7 @@
 From 032b674851ad878aae4fa10edd0ccfc245673e01 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Wed, 11 Nov 2026 17:35:28 +0000
-Subject: [PATCH 9/9] git_ui: Keep a thread on its line when the diff is
+Subject: [PATCH 09/10] git_ui: Keep a thread on its line when the diff is
  re-sorted
 
 A thread read from GitLab started at a left-leaning anchor at the head

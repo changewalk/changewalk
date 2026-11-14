@@ -1,0 +1,1175 @@
+From f812dfe28464b784c43b79df2f996469f4f3b491 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Sat, 14 Nov 2026 15:24:14 +0000
+Subject: [PATCH 10/10] git_ui: Draw merge request threads like the threads on
+ lines
+
+A thread on the merge request itself had its own look, with Reply and
+Resolve as text buttons, and its own Start Thread button in the title
+row. It is now drawn with the parts of a thread on a line: the same
+chip when folded, and when open the same comment card with the draft,
+reply and resolve icon buttons, the same indented replies, and a
+one-line reply box where Enter sends. A reply can be drafted with the
+model here too, from the thread alone, since it has no code of its own.
+
+The Start Thread button is gone from the title row. The comments menu
+has the entry that opens the box for a new thread, lists these threads
+with the comments on lines, counts them, and is shown for any merge
+request, even one with no comment yet.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/git_ui/src/branch_diff.rs              |  43 +-
+ crates/git_ui/src/diff_multibuffer.rs         | 684 ++++++++++++------
+ crates/git_ui/src/project_diff.rs             | 123 +++-
+ .../src/review_general_reply_prompt.txt       |   9 +
+ crates/git_ui/src/review_order.rs             |  40 +
+ 5 files changed, 654 insertions(+), 245 deletions(-)
+ create mode 100644 crates/git_ui/src/review_general_reply_prompt.txt
+
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index 4705c501a6..e62111bfe6 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -1630,8 +1630,9 @@ mod tests {
+     }
+ 
+     /// Threads on the merge request itself have no line to sit under, so
+-    /// they show under the description: folded to a line, opened by a
+-    /// click, and kept as they are on screen across a refresh.
++    /// they show under the description: folded to a chip, opened by a
++    /// click or from the comments menu, and kept as they are on screen
++    /// across a refresh.
+     #[gpui::test]
+     async fn test_merge_request_threads_show_under_the_description(cx: &mut TestAppContext) {
+         use crate::gitlab_review::{GeneralDiscussion, RemoteNote};
+@@ -1723,11 +1724,47 @@ mod tests {
+             Some(("1 open general thread".to_string(), Color::Warning))
+         );
+ 
+-        // A click on the line opens the thread.
++        // The comments menu lists them with the comments on lines.
++        use crate::diff_multibuffer::GeneralThreadEntry;
++        assert_eq!(
++            diff.read_with(cx, |diff, _| diff.general_thread_entries()),
++            vec![
++                GeneralThreadEntry {
++                    discussion_id: "open".into(),
++                    author: "Ada".into(),
++                    snippet: "The after video looks the same to me.".into(),
++                    resolved: false,
++                    replies: 0,
++                },
++                GeneralThreadEntry {
++                    discussion_id: "resolved".into(),
++                    author: "Bob".into(),
++                    snippet: "Is there a recording?".into(),
++                    resolved: true,
++                    replies: 0,
++                },
++            ]
++        );
++
++        // A click on the chip opens the thread, and a click on its header
++        // folds it to the chip again.
+         cx.simulate_click(open_line.center(), gpui::Modifiers::none());
+         cx.run_until_parked();
+         assert!(cx.debug_bounds("general-thread-body-0").is_some());
+         assert!(cx.debug_bounds("general-thread-body-1").is_none());
++        let header = cx.debug_bounds("general-thread-0").unwrap();
++        cx.simulate_click(header.center(), gpui::Modifiers::none());
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("general-thread-body-0").is_none());
++
++        // Picked in the comments menu, a thread opens even with the
++        // description folded away.
++        diff.update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("merge-request-threads").is_none());
++        diff.update(cx, |diff, cx| diff.show_general_thread("open", cx));
++        cx.run_until_parked();
++        assert!(cx.debug_bounds("general-thread-body-0").is_some());
+ 
+         // A refresh brings a reply and keeps the thread open; the thread
+         // GitLab no longer lists goes.
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index b1192084d9..a0ee4fe331 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -9,9 +9,9 @@ use crate::{
+     review_cache::{self, LastReview},
+     review_order::{
+         MAX_EXCERPT_BYTES_PER_FILE, NotesStreamParser, ReviewNotes, ReviewOrder, ReviewOrderFile,
+-        SummaryComment, ThreadNote, build_notes_prompt, build_order_prompt, build_reply_prompt,
+-        build_summary_prompt, link_file_references, order_from_description, parse_review_file_url,
+-        parse_review_order,
++        SummaryComment, ThreadNote, build_general_reply_prompt, build_notes_prompt,
++        build_order_prompt, build_reply_prompt, build_summary_prompt, link_file_references,
++        order_from_description, parse_review_file_url, parse_review_order,
+     },
+ };
+ use agent_settings::AgentSettings;
+@@ -197,8 +197,10 @@ const DESCRIPTION_HANDLE_SIZE: Pixels = px(6.);
+ /// The threads on the merge request itself scroll past this height, so a
+ /// long discussion does not push the diff off the screen.
+ const GENERAL_THREADS_MAX_HEIGHT: gpui::Rems = rems(20.);
+-/// How much of a thread's first line its folded line shows.
+-const GENERAL_THREAD_PREVIEW_CHARS: usize = 100;
++/// How much of a thread's first line its chip shows, as on a line's chip.
++const GENERAL_THREAD_PREVIEW_CHARS: usize = 80;
++/// The room for the icon before an author's name, as beside a line's comment.
++const GENERAL_THREAD_AVATAR_SIZE: Pixels = px(20.);
+ 
+ /// The summary comment being written to finish a review.
+ struct ReviewSummary {
+@@ -218,7 +220,24 @@ struct GeneralThread {
+     /// Shown in full; otherwise one line.
+     expanded: bool,
+     /// The box for a reply, while one is being written.
+-    reply: Option<Entity<Editor>>,
++    reply: Option<GeneralReply>,
++}
++
++/// The reply box of a thread on the merge request itself. Enter sends, as
++/// in the reply box of a thread on a line.
++struct GeneralReply {
++    editor: Entity<Editor>,
++    _send_on_enter: Subscription,
++}
++
++/// A thread on the merge request itself as the comments menu lists it.
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct GeneralThreadEntry {
++    pub discussion_id: String,
++    pub author: SharedString,
++    pub snippet: String,
++    pub resolved: bool,
++    pub replies: usize,
+ }
+ 
+ #[derive(Clone)]
+@@ -1008,16 +1027,6 @@ impl DiffMultibuffer {
+                     .map(|(text, color)| Label::new(text).size(LabelSize::Small).color(color)),
+             )
+             .child(div().flex_1())
+-            .child(
+-                Button::new("merge-request-start-thread", "Start Thread")
+-                    .label_size(LabelSize::Small)
+-                    .tooltip(Tooltip::text(
+-                        "Start a thread on the merge request itself, not on a line",
+-                    ))
+-                    .on_click(
+-                        cx.listener(|this, _, window, cx| this.start_general_thread(window, cx)),
+-                    ),
+-            )
+             .child(
+                 IconButton::new("merge-request-open", IconName::ArrowUpRight)
+                     .icon_size(IconSize::Small)
+@@ -1141,8 +1150,9 @@ impl DiffMultibuffer {
+         }
+     }
+ 
+-    /// The threads on the merge request itself, each folded to a line until
+-    /// clicked, and the box for a new one.
++    /// The threads on the merge request itself, drawn as the threads on
++    /// lines are: a chip until clicked, then the comment with its replies.
++    /// Under them, the box for a new thread while one is being written.
+     fn render_general_threads(
+         &self,
+         window: &Window,
+@@ -1152,11 +1162,14 @@ impl DiffMultibuffer {
+             return None;
+         }
+         let markdown_style = editor::hover_markdown_style(window, cx);
++        let line_height = window.line_height();
+         let threads: Vec<AnyElement> = self
+             .general_threads
+             .iter()
+             .enumerate()
+-            .map(|(index, thread)| self.render_general_thread(index, thread, &markdown_style, cx))
++            .map(|(index, thread)| {
++                self.render_general_thread(index, thread, line_height, &markdown_style, cx)
++            })
+             .collect();
+         let busy = self.general_thread_busy;
+         let colors = cx.theme().colors();
+@@ -1176,36 +1189,44 @@ impl DiffMultibuffer {
+                     .size(LabelSize::Small)
+                     .color(Color::Muted),
+                 )
+-                .child(
+-                    div()
+-                        .w_full()
+-                        .border_1()
+-                        .border_color(colors.border)
+-                        .rounded_md()
+-                        .bg(colors.editor_background)
+-                        .px_2()
+-                        .py_1()
+-                        .child(editor),
+-                )
+                 .child(
+                     h_flex()
+                         .w_full()
+-                        .gap_1()
+-                        .child(div().flex_1())
++                        .items_center()
++                        .gap_2()
+                         .child(
+-                            Button::new("general-thread-start", "Start Thread")
+-                                .style(ButtonStyle::Filled)
+-                                .disabled(busy)
+-                                .on_click(cx.listener(|this, _, window, cx| {
+-                                    this.post_general_thread(window, cx)
+-                                })),
++                            div()
++                                .flex_1()
++                                .border_1()
++                                .border_color(colors.border)
++                                .rounded_md()
++                                .bg(colors.editor_background)
++                                .px_2()
++                                .py_1()
++                                .child(editor),
+                         )
+                         .child(
+-                            IconButton::new("general-thread-close", IconName::Close)
+-                                .icon_size(IconSize::Small)
+-                                .tooltip(Tooltip::text("Close"))
+-                                .on_click(
+-                                    cx.listener(|this, _, _, cx| this.close_new_general_thread(cx)),
++                            h_flex()
++                                .flex_shrink_0()
++                                .gap_1()
++                                .child(
++                                    IconButton::new("general-thread-close", IconName::Close)
++                                        .icon_color(Color::Muted)
++                                        .icon_size(IconSize::XSmall)
++                                        .tooltip(Tooltip::text("Discard thread"))
++                                        .on_click(cx.listener(|this, _, _, cx| {
++                                            this.close_new_general_thread(cx)
++                                        })),
++                                )
++                                .child(
++                                    IconButton::new("general-thread-start", IconName::Send)
++                                        .icon_color(Color::Muted)
++                                        .icon_size(IconSize::XSmall)
++                                        .disabled(busy)
++                                        .tooltip(Tooltip::text("Start the thread on GitLab"))
++                                        .on_click(cx.listener(|this, _, window, cx| {
++                                            this.post_general_thread(window, cx)
++                                        })),
+                                 ),
+                         ),
+                 )
+@@ -1224,7 +1245,7 @@ impl DiffMultibuffer {
+                             .w_full()
+                             .max_h(GENERAL_THREADS_MAX_HEIGHT)
+                             .overflow_y_scroll()
+-                            .px_1()
++                            .px_2()
+                             .gap_0p5()
+                             .children(threads),
+                     )
+@@ -1234,222 +1255,337 @@ impl DiffMultibuffer {
+         )
+     }
+ 
+-    /// One thread on the merge request itself: a line saying who opened it,
+-    /// its state and its first words, and under it, when open, the notes
+-    /// with the reply and resolve buttons.
++    /// One thread on the merge request itself, with the same parts as a
++    /// thread on a line: folded, a chip saying who opened it, when, its
++    /// state and its first words; open, the comment with the draft, reply
++    /// and resolve buttons, then the replies and the reply box.
+     fn render_general_thread(
+         &self,
+         index: usize,
+         thread: &GeneralThread,
++        line_height: Pixels,
+         markdown_style: &MarkdownStyle,
+         cx: &mut Context<Self>,
+     ) -> AnyElement {
+         let colors = cx.theme().colors();
+         let busy = self.general_thread_busy;
+         let resolved = thread.resolved;
+-        let state_color = if resolved {
+-            Color::Success
+-        } else {
+-            Color::Warning
++        let Some(first) = thread.notes.first() else {
++            return div().into_any_element();
+         };
+-        let author = thread
+-            .notes
+-            .first()
+-            .map(|note| note.author.clone())
+-            .unwrap_or_default();
+-        let posted_at = thread.notes.first().and_then(|note| note.posted_at.clone());
+-        let preview = thread
+-            .notes
+-            .first()
+-            .map(|note| preview_of(&note.body))
+-            .unwrap_or_default();
+         let replies = thread.notes.len().saturating_sub(1);
+-        let line = h_flex()
++        let toggle = cx.listener({
++            let discussion_id = thread.discussion_id.clone();
++            move |this, _: &gpui::ClickEvent, _, cx| this.toggle_general_thread(&discussion_id, cx)
++        });
++
++        if !thread.expanded {
++            let state_color = if resolved {
++                Color::Success
++            } else {
++                Color::Warning
++            };
++            return h_flex()
++                .w_full()
++                .h(line_height)
++                .items_center()
++                .child(
++                    h_flex()
++                        .id(("general-thread", index))
++                        .debug_selector(|| format!("general-thread-{index}"))
++                        .h(line_height - px(2.))
++                        .max_w_full()
++                        .px_2()
++                        .gap_1p5()
++                        .items_center()
++                        .rounded_md()
++                        .border_1()
++                        .border_color(if resolved {
++                            colors.border_variant
++                        } else {
++                            colors.border
++                        })
++                        .bg(colors.surface_background)
++                        .cursor_pointer()
++                        .hover(|style| style.bg(colors.ghost_element_hover))
++                        .overflow_hidden()
++                        .on_click(toggle)
++                        .child(
++                            Icon::new(if resolved {
++                                IconName::CheckDouble
++                            } else {
++                                IconName::Chat
++                            })
++                            .size(IconSize::XSmall)
++                            .color(state_color),
++                        )
++                        .child(Label::new(first.author.clone()).size(LabelSize::Small))
++                        .children(first.posted_at.clone().map(|posted_at| {
++                            Label::new(posted_at)
++                                .size(LabelSize::XSmall)
++                                .color(Color::Muted)
++                        }))
++                        .child(
++                            Label::new(if resolved { "Resolved" } else { "Open" })
++                                .size(LabelSize::XSmall)
++                                .color(state_color),
++                        )
++                        .when(thread.since_last_review, |el| {
++                            el.child(
++                                Label::new("New")
++                                    .size(LabelSize::XSmall)
++                                    .color(Color::Accent),
++                            )
++                        })
++                        .when(replies > 0, |el| {
++                            el.child(
++                                Label::new(format!(
++                                    "{replies} {}",
++                                    if replies == 1 { "reply" } else { "replies" }
++                                ))
++                                .size(LabelSize::XSmall)
++                                .color(Color::Muted),
++                            )
++                        })
++                        .child(
++                            Label::new(preview_of(&first.body))
++                                .size(LabelSize::Small)
++                                .color(Color::Muted)
++                                .truncate(),
++                        ),
++                )
++                .into_any_element();
++        }
++
++        let body = |note: &GeneralNote| {
++            div().w_full().text_sm().text_color(colors.text).child(
++                MarkdownElement::new(note.markdown.clone(), markdown_style.clone())
++                    .code_block_renderer(CodeBlockRenderer::Default {
++                        copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
++                        wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
++                        border: true,
++                    }),
++            )
++        };
++        let posted_at = |note: &GeneralNote| {
++            note.posted_at.clone().map(|posted_at| {
++                Label::new(posted_at)
++                    .size(LabelSize::XSmall)
++                    .color(Color::Muted)
++            })
++        };
++        let action = |name: &'static str, icon: IconName| {
++            IconButton::new((name, index), icon)
++                .icon_size(IconSize::XSmall)
++                .disabled(busy)
++        };
++        let header = h_flex()
+             .id(("general-thread", index))
+             .debug_selector(|| format!("general-thread-{index}"))
+             .w_full()
+-            .px_2()
+-            .gap_1p5()
+             .items_center()
+-            .rounded_md()
++            .gap_1()
++            .px_2()
++            .py_1()
+             .cursor_pointer()
++            .rounded_md()
+             .overflow_hidden()
+             .hover(|style| style.bg(colors.ghost_element_hover))
+-            .on_click(cx.listener({
+-                let discussion_id = thread.discussion_id.clone();
+-                move |this, _, _, cx| this.toggle_general_thread(&discussion_id, cx)
+-            }))
++            .on_click(toggle)
+             .child(
+-                Icon::new(if thread.expanded {
+-                    IconName::ChevronDown
+-                } else {
+-                    IconName::ChevronRight
+-                })
+-                .size(IconSize::XSmall)
+-                .color(Color::Muted),
++                Icon::new(IconName::ChevronDown)
++                    .size(IconSize::Small)
++                    .color(Color::Muted),
+             )
+             .child(
+-                Icon::new(if resolved {
+-                    IconName::CheckDouble
+-                } else {
+-                    IconName::Chat
+-                })
+-                .size(IconSize::XSmall)
+-                .color(state_color),
+-            )
+-            .child(Label::new(author).size(LabelSize::Small))
+-            // Open, each note says its own time under the line.
+-            .when(!thread.expanded, |el| {
+-                el.children(posted_at.map(|posted_at| {
+-                    Label::new(posted_at)
+-                        .size(LabelSize::XSmall)
+-                        .color(Color::Muted)
+-                }))
+-            })
++                Label::new("1 Comment")
++                    .size(LabelSize::Small)
++                    .color(Color::Muted),
++            );
++        let comment = v_flex()
++            .w_full()
++            .gap_0p5()
++            .px_2()
++            .py_1()
++            .rounded_md()
++            .bg(colors.surface_background)
+             .child(
+-                Label::new(if resolved { "Resolved" } else { "Open" })
+-                    .size(LabelSize::XSmall)
+-                    .color(state_color),
++                h_flex()
++                    .w_full()
++                    .h(line_height)
++                    .items_center()
++                    .gap_2()
++                    .child(
++                        div()
++                            .size(GENERAL_THREAD_AVATAR_SIZE)
++                            .flex_shrink_0()
++                            .rounded_full()
++                            .overflow_hidden()
++                            .child(
++                                Icon::new(IconName::Person)
++                                    .size(IconSize::Small)
++                                    .color(Color::Muted),
++                            ),
++                    )
++                    .child(
++                        Label::new(first.author.clone())
++                            .size(LabelSize::Small)
++                            .color(Color::Muted),
++                    )
++                    .children(posted_at(first))
++                    .child(div().flex_1())
++                    .child(
++                        h_flex()
++                            .gap_1()
++                            .items_center()
++                            .when(thread.since_last_review, |el| {
++                                el.child(
++                                    Label::new("New since your review")
++                                        .size(LabelSize::XSmall)
++                                        .color(Color::Accent),
++                                )
++                            })
++                            .when(resolved, |el| {
++                                el.child(
++                                    Label::new("Resolved")
++                                        .size(LabelSize::XSmall)
++                                        .color(Color::Success),
++                                )
++                            })
++                            .child(
++                                action("general-thread-draft-reply", IconName::Sparkle)
++                                    .icon_color(Color::Muted)
++                                    .tooltip(Tooltip::text("Draft a reply with the model"))
++                                    .on_click(cx.listener({
++                                        let discussion_id = thread.discussion_id.clone();
++                                        move |this, _, window, cx| {
++                                            this.draft_general_reply(
++                                                discussion_id.clone(),
++                                                window,
++                                                cx,
++                                            )
++                                        }
++                                    })),
++                            )
++                            .child(
++                                action("general-thread-reply", IconName::ReplyArrowRight)
++                                    .icon_color(Color::Muted)
++                                    .tooltip(Tooltip::text("Reply"))
++                                    .on_click(cx.listener({
++                                        let discussion_id = thread.discussion_id.clone();
++                                        move |this, _, window, cx| {
++                                            this.reply_to_general_thread(&discussion_id, window, cx)
++                                        }
++                                    })),
++                            )
++                            .child(
++                                action(
++                                    "general-thread-resolve",
++                                    if resolved {
++                                        IconName::CheckDouble
++                                    } else {
++                                        IconName::Check
++                                    },
++                                )
++                                .icon_color(Color::Success)
++                                .tooltip(Tooltip::text(if resolved {
++                                    "Reopen thread"
++                                } else {
++                                    "Resolve thread"
++                                }))
++                                .on_click(cx.listener({
++                                    let discussion_id = thread.discussion_id.clone();
++                                    move |this, _, window, cx| {
++                                        this.resolve_general_thread(
++                                            discussion_id.clone(),
++                                            !resolved,
++                                            window,
++                                            cx,
++                                        )
++                                    }
++                                })),
++                            ),
++                    ),
+             )
+-            .when(thread.since_last_review, |el| {
+-                el.child(
+-                    Label::new("New")
+-                        .size(LabelSize::XSmall)
+-                        .color(Color::Accent),
+-                )
+-            })
+-            .when(replies > 0, |el| {
+-                el.child(
+-                    Label::new(format!(
+-                        "{replies} {}",
+-                        if replies == 1 { "reply" } else { "replies" }
+-                    ))
+-                    .size(LabelSize::XSmall)
+-                    .color(Color::Muted),
+-                )
+-            })
+-            .when(!thread.expanded, |el| {
+-                el.child(
+-                    Label::new(preview)
+-                        .size(LabelSize::Small)
+-                        .color(Color::Muted)
+-                        .truncate(),
+-                )
+-            });
+-        if !thread.expanded {
+-            return line.into_any_element();
+-        }
+-
+-        let notes = thread.notes.iter().map(|note| {
++            .child(body(first));
++        let reply_rows = thread.notes.iter().skip(1).map(|note| {
+             v_flex()
+                 .w_full()
++                .pl_8()
++                .pr_2()
++                .py_1()
++                .gap_0p5()
+                 .child(
+                     h_flex()
+-                        .gap_2()
++                        .h(line_height)
+                         .items_center()
++                        .gap_2()
+                         .child(
+                             Label::new(note.author.clone())
+                                 .size(LabelSize::Small)
+-                                .weight(FontWeight::SEMIBOLD),
++                                .color(Color::Muted),
+                         )
+-                        .children(note.posted_at.clone().map(|posted_at| {
+-                            Label::new(posted_at)
+-                                .size(LabelSize::XSmall)
+-                                .color(Color::Muted)
+-                        })),
++                        .children(posted_at(note)),
+                 )
+-                .child(div().w_full().text_sm().child(MarkdownElement::new(
+-                    note.markdown.clone(),
+-                    markdown_style.clone(),
+-                )))
++                .child(body(note))
+         });
+-        let buttons = match thread.reply.clone() {
+-            Some(editor) => v_flex()
++        let reply_box = thread.reply.as_ref().map(|reply| {
++            h_flex()
+                 .w_full()
+-                .gap_1()
++                .pl_8()
++                .pr_2()
++                .py_1()
++                .items_center()
++                .gap_2()
+                 .child(
+                     div()
+-                        .w_full()
++                        .flex_1()
+                         .border_1()
+                         .border_color(colors.border)
+                         .rounded_md()
+                         .bg(colors.editor_background)
+                         .px_2()
+                         .py_1()
+-                        .child(editor),
++                        .child(reply.editor.clone()),
+                 )
+                 .child(
+                     h_flex()
++                        .flex_shrink_0()
+                         .gap_1()
+                         .child(
+-                            Button::new(("general-thread-send", index), "Send")
+-                                .style(ButtonStyle::Filled)
+-                                .disabled(busy)
++                            IconButton::new(
++                                ("general-thread-reply-cancel", index),
++                                IconName::Close,
++                            )
++                            .icon_color(Color::Muted)
++                            .icon_size(IconSize::XSmall)
++                            .tooltip(Tooltip::text("Discard reply"))
++                            .on_click(cx.listener({
++                                let discussion_id = thread.discussion_id.clone();
++                                move |this, _, _, cx| this.cancel_general_reply(&discussion_id, cx)
++                            })),
++                        )
++                        .child(
++                            action("general-thread-reply-send", IconName::Send)
++                                .icon_color(Color::Muted)
++                                .tooltip(Tooltip::text("Send reply to GitLab"))
+                                 .on_click(cx.listener({
+                                     let discussion_id = thread.discussion_id.clone();
+                                     move |this, _, window, cx| {
+                                         this.send_general_reply(discussion_id.clone(), window, cx)
+                                     }
+                                 })),
+-                        )
+-                        .child(
+-                            Button::new(("general-thread-cancel", index), "Cancel").on_click(
+-                                cx.listener({
+-                                    let discussion_id = thread.discussion_id.clone();
+-                                    move |this, _, _, cx| {
+-                                        this.cancel_general_reply(&discussion_id, cx)
+-                                    }
+-                                }),
+-                            ),
+                         ),
+-                ),
+-            None => v_flex().w_full().child(
+-                h_flex()
+-                    .gap_1()
+-                    .child(
+-                        Button::new(("general-thread-reply", index), "Reply")
+-                            .disabled(busy)
+-                            .on_click(cx.listener({
+-                                let discussion_id = thread.discussion_id.clone();
+-                                move |this, _, window, cx| {
+-                                    this.reply_to_general_thread(&discussion_id, window, cx)
+-                                }
+-                            })),
+-                    )
+-                    .child(
+-                        Button::new(
+-                            ("general-thread-resolve", index),
+-                            if resolved { "Reopen" } else { "Resolve" },
+-                        )
+-                        .disabled(busy)
+-                        .on_click(cx.listener({
+-                            let discussion_id = thread.discussion_id.clone();
+-                            move |this, _, window, cx| {
+-                                this.resolve_general_thread(
+-                                    discussion_id.clone(),
+-                                    !resolved,
+-                                    window,
+-                                    cx,
+-                                )
+-                            }
+-                        })),
+-                    ),
+-            ),
+-        };
++                )
++        });
+         v_flex()
+             .w_full()
+-            .child(line)
+-            .child(
+-                v_flex()
+-                    .w_full()
+-                    .debug_selector(|| format!("general-thread-body-{index}"))
+-                    .pl_6()
+-                    .pr_2()
+-                    .pb_1()
+-                    .gap_1p5()
+-                    .children(notes)
+-                    .child(buttons),
+-            )
++            .debug_selector(|| format!("general-thread-body-{index}"))
++            .gap_1()
++            .child(header)
++            .child(comment)
++            .children(reply_rows)
++            .children(reply_box)
+             .into_any_element()
+     }
+ 
+@@ -2128,31 +2264,136 @@ impl DiffMultibuffer {
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+-        let Some(shown) = self
+-            .general_thread_mut(discussion_id)
+-            .map(|thread| thread.reply.clone())
+-        else {
++        let Some(editor) = self.general_reply_editor(discussion_id, window, cx) else {
+             return;
+         };
+-        let editor = match shown {
+-            Some(editor) => editor,
+-            None => {
+-                let editor = cx.new(|cx| {
+-                    let mut editor = Editor::auto_height(1, 8, window, cx);
+-                    editor.set_placeholder_text("Reply…", window, cx);
+-                    editor
+-                });
+-                if let Some(thread) = self.general_thread_mut(discussion_id) {
+-                    thread.reply = Some(editor.clone());
+-                }
+-                editor
+-            }
+-        };
+         let focus_handle = editor.focus_handle(cx);
+         window.focus(&focus_handle, cx);
+         cx.notify();
+     }
+ 
++    /// The thread's reply box, made if it is not open yet: one line, where
++    /// Enter sends, as in the reply box of a thread on a line.
++    fn general_reply_editor(
++        &mut self,
++        discussion_id: &str,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Option<Entity<Editor>> {
++        let open = self
++            .general_thread_mut(discussion_id)?
++            .reply
++            .as_ref()
++            .map(|reply| reply.editor.clone());
++        if open.is_some() {
++            return open;
++        }
++        let editor = cx.new(|cx| {
++            let mut editor = Editor::single_line(window, cx);
++            editor.set_placeholder_text("Reply…", window, cx);
++            editor
++        });
++        let this = cx.weak_entity();
++        let send_on_enter = editor.update(cx, |editor, _| {
++            let discussion_id = discussion_id.to_string();
++            editor.register_action(move |_: &editor::actions::Newline, window, cx| {
++                this.update(cx, |this, cx| {
++                    this.send_general_reply(discussion_id.clone(), window, cx)
++                })
++                .ok();
++            })
++        });
++        self.general_thread_mut(discussion_id)?.reply = Some(GeneralReply {
++            editor: editor.clone(),
++            _send_on_enter: send_on_enter,
++        });
++        Some(editor)
++    }
++
++    /// Asks the model for a reply to the thread and puts it in the reply
++    /// box for editing.
++    fn draft_general_reply(
++        &mut self,
++        discussion_id: String,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let Some(thread) = self
++            .general_threads
++            .iter()
++            .find(|thread| thread.discussion_id == discussion_id)
++        else {
++            return;
++        };
++        let own_name = self
++            .merge_request
++            .as_ref()
++            .and_then(|header| header.reviewer.as_ref())
++            .map(|reviewer| reviewer.name.clone())
++            .filter(|name| !name.is_empty())
++            .unwrap_or_else(|| "the reviewer".to_string());
++        let notes: Vec<ThreadNote> = thread
++            .notes
++            .iter()
++            .map(|note| ThreadNote {
++                author: note.author.to_string(),
++                body: note.body.clone(),
++            })
++            .collect();
++        let prompt =
++            build_general_reply_prompt(self.merge_request_context().as_deref(), &notes, &own_name);
++        let request = self.model_request(prompt, cx);
++        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
++            let result = match request {
++                Ok((provider, model, request)) => complete_text(provider, model, request, cx).await,
++                Err(error) => Err(error),
++            };
++            this.update_in(cx, |this, window, cx| match result {
++                Ok(text) => {
++                    if let Some(editor) = this.general_reply_editor(&discussion_id, window, cx) {
++                        editor.update(cx, |editor, cx| editor.set_text(text.trim(), window, cx));
++                        let focus_handle = editor.focus_handle(cx);
++                        window.focus(&focus_handle, cx);
++                        cx.notify();
++                    }
++                }
++                Err(error) => {
++                    this.show_workspace_error(format!("Could not draft a reply: {error:#}"), cx)
++                }
++            })
++            .ok();
++        }));
++    }
++
++    /// The threads on the merge request itself, for the comments menu.
++    pub(crate) fn general_thread_entries(&self) -> Vec<GeneralThreadEntry> {
++        self.general_threads
++            .iter()
++            .filter_map(|thread| {
++                let first = thread.notes.first()?;
++                Some(GeneralThreadEntry {
++                    discussion_id: thread.discussion_id.clone(),
++                    author: first.author.clone(),
++                    snippet: preview_of(&first.body),
++                    resolved: thread.resolved,
++                    replies: thread.notes.len() - 1,
++                })
++            })
++            .collect()
++    }
++
++    /// Opens the thread in full under the description, unfolding the
++    /// description if it is folded away.
++    pub(crate) fn show_general_thread(&mut self, discussion_id: &str, cx: &mut Context<Self>) {
++        if let Some(header) = self.merge_request.as_mut() {
++            header.expanded = true;
++        }
++        if let Some(thread) = self.general_thread_mut(discussion_id) {
++            thread.expanded = true;
++        }
++        cx.notify();
++    }
++
+     fn cancel_general_reply(&mut self, discussion_id: &str, cx: &mut Context<Self>) {
+         if let Some(thread) = self.general_thread_mut(discussion_id) {
+             thread.reply = None;
+@@ -2173,7 +2414,8 @@ impl DiffMultibuffer {
+         }
+         let Some(editor) = self
+             .general_thread_mut(&discussion_id)
+-            .and_then(|thread| thread.reply.clone())
++            .and_then(|thread| thread.reply.as_ref())
++            .map(|reply| reply.editor.clone())
+         else {
+             return;
+         };
+diff --git a/crates/git_ui/src/project_diff.rs b/crates/git_ui/src/project_diff.rs
+index ee528b9c8e..18bafc2662 100644
+--- a/crates/git_ui/src/project_diff.rs
++++ b/crates/git_ui/src/project_diff.rs
+@@ -1197,6 +1197,35 @@ impl Render for ProjectDiffToolbar {
+     }
+ }
+ 
++/// What the comments menu calls the entry that opens the box for a thread
++/// on the merge request itself.
++const START_MERGE_REQUEST_THREAD_LABEL: &str = "Start a Thread on the Merge Request…";
++
++/// One line of the comments menu: a mark for the comment's state, who
++/// wrote it, where it is, how many replies it has, and its first words.
++fn comments_menu_label(
++    posted: bool,
++    resolved: bool,
++    author: &str,
++    place: &str,
++    replies: usize,
++    snippet: &str,
++) -> String {
++    let mark = if !posted {
++        "✎"
++    } else if resolved {
++        "✓"
++    } else {
++        "○"
++    };
++    let replies = if replies > 0 {
++        format!(" (+{replies})")
++    } else {
++        String::new()
++    };
++    format!("{mark} {author} · {place}{replies} — {snippet}")
++}
++
+ /// The buttons that need a merge request: one that diffs against the
+ /// commit last reviewed when the branch has moved on since, and one that
+ /// finishes the review.
+@@ -1207,44 +1236,73 @@ pub(crate) fn render_review_buttons(
+ ) -> Vec<AnyElement> {
+     let diff = diff_entity.read(cx);
+     let mut buttons = Vec::new();
+-    if let Some((_, total)) = diff.review_comment_position(cx) {
+-        let entries = diff.review_comment_entries(cx);
++    // The comments menu lists every comment, the threads on the merge
++    // request itself among them, and is where a thread of that kind is
++    // started. So it is there for any merge request, even one with no
++    // comment yet.
++    let entries = diff.review_comment_entries(cx);
++    let general = diff.general_thread_entries();
++    let has_merge_request = diff.has_merge_request();
++    let total = entries.len() + general.len();
++    if total > 0 || has_merge_request {
+         let diff_for_menu = diff_entity.downgrade();
+         let open = entries
+             .iter()
+             .filter(|entry| entry.posted && !entry.resolved)
+-            .count();
++            .count()
++            + general.iter().filter(|thread| !thread.resolved).count();
+         let label = format!("{total} comment{}", if total == 1 { "" } else { "s" });
+         buttons.push(Divider::vertical().into_any_element());
+         buttons.push(
+             PopoverMenu::new("review-comments-overview")
+                 .menu(move |window, cx| {
+                     let entries = entries.clone();
++                    let general = general.clone();
+                     let diff_for_menu = diff_for_menu.clone();
+                     Some(ContextMenu::build(window, cx, |mut menu, _, _| {
++                        // The menu holds focus while it is open, so an
++                        // action dispatched from it would not reach the
++                        // diff view; the view is updated directly.
++                        if has_merge_request {
++                            let diff = diff_for_menu.clone();
++                            menu = menu
++                                .entry(START_MERGE_REQUEST_THREAD_LABEL, None, move |window, cx| {
++                                    diff.update(cx, |diff, cx| {
++                                        diff.start_general_thread(window, cx)
++                                    })
++                                    .ok();
++                                })
++                                .separator();
++                        }
+                         menu = menu.header(format!("{total} comments, {open} open"));
++                        for thread in general {
++                            let label = comments_menu_label(
++                                true,
++                                thread.resolved,
++                                &thread.author,
++                                "merge request",
++                                thread.replies,
++                                &thread.snippet,
++                            );
++                            let diff = diff_for_menu.clone();
++                            menu = menu.entry(label, None, move |_, cx| {
++                                diff.update(cx, |diff, cx| {
++                                    diff.show_general_thread(&thread.discussion_id, cx)
++                                })
++                                .ok();
++                            });
++                        }
+                         for entry in entries {
+-                            let mark = if !entry.posted {
+-                                "✎"
+-                            } else if entry.resolved {
+-                                "✓"
+-                            } else {
+-                                "○"
+-                            };
+-                            let replies = if entry.replies > 0 {
+-                                format!(" (+{})", entry.replies)
+-                            } else {
+-                                String::new()
+-                            };
+                             let file = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+-                            let label = format!(
+-                                "{mark} {} · {file}:{}{replies} — {}",
+-                                entry.author, entry.line, entry.snippet
++                            let label = comments_menu_label(
++                                entry.posted,
++                                entry.resolved,
++                                &entry.author,
++                                &format!("{file}:{}", entry.line),
++                                entry.replies,
++                                &entry.snippet,
+                             );
+                             let id = entry.id;
+-                            // The menu holds focus while it is open, so an
+-                            // action dispatched from it would not reach the
+-                            // diff view; the view is updated directly.
+                             let diff = diff_for_menu.clone();
+                             menu = menu.entry(label, None, move |window, cx| {
+                                 diff.update(cx, |diff, cx| {
+@@ -2721,6 +2779,29 @@ mod tests {
+         assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+     }
+ 
++    #[test]
++    fn test_comments_menu_labels_say_state_place_and_replies() {
++        assert_eq!(
++            comments_menu_label(true, false, "Ada", "router.py:45", 1, "Why a full Chat?"),
++            "○ Ada · router.py:45 (+1) — Why a full Chat?"
++        );
++        assert_eq!(
++            comments_menu_label(
++                true,
++                true,
++                "Bob",
++                "merge request",
++                0,
++                "Is there a recording?"
++            ),
++            "✓ Bob · merge request — Is there a recording?"
++        );
++        assert_eq!(
++            comments_menu_label(false, false, "You", "inputs.py:405", 0, "Check this."),
++            "✎ You · inputs.py:405 — Check this."
++        );
++    }
++
+     /// A thread on the first line after removed lines must keep its line
+     /// through a re-sort. The removed lines are drawn right above it, and
+     /// reading its place off the screen there gives a line of the old file,
+diff --git a/crates/git_ui/src/review_general_reply_prompt.txt b/crates/git_ui/src/review_general_reply_prompt.txt
+new file mode 100644
+index 0000000000..c121cd170d
+--- /dev/null
++++ b/crates/git_ui/src/review_general_reply_prompt.txt
+@@ -0,0 +1,9 @@
++You draft a reply in a code review thread on behalf of one of its participants. The thread is on the merge request as a whole, not on a line of its diff.
++
++Rules:
++- Write as the person named below, first person, British English, plain and direct.
++- Answer what the last message asks or argues. Agree, disagree, or ask for what is missing, with the reason, in one to three sentences.
++- Do not restate the thread, do not add pleasantries, and do not invent facts about code you cannot see.
++- At most 80 words.
++
++Reply with the message text only, no preamble.
+diff --git a/crates/git_ui/src/review_order.rs b/crates/git_ui/src/review_order.rs
+index 443d339a0a..c6719fe10a 100644
+--- a/crates/git_ui/src/review_order.rs
++++ b/crates/git_ui/src/review_order.rs
+@@ -452,6 +452,24 @@ pub(crate) fn build_reply_prompt(
+     prompt
+ }
+ 
++/// The prompt that asks for a reply to a thread on the merge request
++/// itself, which has no code of its own to show: only what the merge
++/// request is and what has been said so far.
++pub(crate) fn build_general_reply_prompt(
++    context: Option<&str>,
++    notes: &[ThreadNote],
++    own_name: &str,
++) -> String {
++    let mut prompt = include_str!("review_general_reply_prompt.txt").to_string();
++    append_context(&mut prompt, context);
++    writeln!(prompt, "\nYou write as {own_name}.").ok();
++    writeln!(prompt, "\nThe thread so far:").ok();
++    for note in notes {
++        writeln!(prompt, "\n{}:\n{}", note.author, note.body.trim()).ok();
++    }
++    prompt
++}
++
+ fn append_context(prompt: &mut String, context: Option<&str>) {
+     if let Some(context) = context.map(str::trim).filter(|context| !context.is_empty()) {
+         let context = truncate_to_lines(context, MAX_CONTEXT_BYTES);
+@@ -702,6 +720,28 @@ pub(crate) fn parse_review_notes(text: &str, known_paths: &[RepoPath]) -> Result
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn test_a_general_reply_prompt_carries_the_thread_and_no_code() {
++        let notes = [
++            ThreadNote {
++                author: "Ada".into(),
++                body: "Is there a recording?\n".into(),
++            },
++            ThreadNote {
++                author: "Bob".into(),
++                body: "Uploaded one.".into(),
++            },
++        ];
++        let prompt = build_general_reply_prompt(Some("Title: A change"), &notes, "Ada");
++        assert!(prompt.contains("the merge request as a whole"));
++        assert!(prompt.contains("About the merge request:\nTitle: A change"));
++        assert!(prompt.contains("You write as Ada."));
++        assert!(prompt.ends_with(
++            "The thread so far:\n\nAda:\nIs there a recording?\n\nBob:\nUploaded one.\n"
++        ));
++        assert!(!prompt.contains("```"));
++    }
++
+     #[test]
+     fn the_description_order_pins_its_files_first_with_the_authors_reasons() {
+         let known: Vec<RepoPath> = [
+-- 
+2.54.0 (Apple Git-157)
+
