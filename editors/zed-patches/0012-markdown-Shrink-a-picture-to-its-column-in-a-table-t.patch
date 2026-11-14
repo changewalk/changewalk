@@ -1,0 +1,226 @@
+From 66c6467cc8669814dc9e61724bc557c473ea886a Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Sat, 14 Nov 2026 16:09:46 +0000
+Subject: [PATCH 12/12] markdown: Shrink a picture to its column in a table
+ that fits its container
+
+A table told to fit its container gives each column a share of the
+width, but no less than the least width of its content, and a picture's
+least width is its whole width in pixels. One screenshot in a cell made
+its column that wide and pushed the table off the side, while the same
+picture in a paragraph shrank in proportion.
+
+In such a table the picture's wrapper now starts from no width and grows
+into its column, so the picture inside shrinks to the column and keeps
+its proportions. The wrapper then fills the cell, so it places a small
+picture by the column's alignment as the cell did.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/git_ui/src/branch_diff.rs |   6 +-
+ crates/markdown/src/markdown.rs  | 146 ++++++++++++++++++++++++++++++-
+ 2 files changed, 148 insertions(+), 4 deletions(-)
+
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index 59afbbe800..7dddd705e8 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -1886,7 +1886,7 @@ mod tests {
+         // The markdown names each picture it draws by where its link starts.
+         let drawn = |link: &str| -> &'static str {
+             let start = text.find(link).unwrap();
+-            Box::leak(format!("markdown_image_{start}").into_boxed_str())
++            Box::leak(format!("markdown_image_content_{start}").into_boxed_str())
+         };
+ 
+         let diff = branch_diff.read_with(cx, |branch_diff, _| branch_diff.diff.clone());
+@@ -1909,8 +1909,8 @@ mod tests {
+         let before = cx
+             .debug_bounds(drawn("![before]"))
+             .expect("the fetched picture is drawn");
+-        // The picture's own 40 by 20 and its margin: the text that stands
+-        // in for a picture that failed to load would be far wider.
++        // The picture's own 40 by 20: the text that stands in for a
++        // picture that failed to load would be far wider.
+         assert!(
+             before.size.width >= px(40.) && before.size.width < px(50.),
+             "{before:?}"
+diff --git a/crates/markdown/src/markdown.rs b/crates/markdown/src/markdown.rs
+index 44e732c06c..01605a5a5b 100644
+--- a/crates/markdown/src/markdown.rs
++++ b/crates/markdown/src/markdown.rs
+@@ -1982,12 +1982,36 @@ impl MarkdownElement {
+             .map(|link| link.destination_url.clone());
+         let fallback_opens_image_url = enclosing_link_url.is_none();
+ 
++        // A table told to fit its container gives each column a share of the
++        // width, but no less than its content's least width, and a picture's
++        // least width is its whole width in pixels: one screenshot pushes
++        // the table off the side. There the wrapper starts from no width and
++        // grows into its column instead, so the picture inside shrinks to
++        // the column in proportion, as it does to a paragraph. The wrapper
++        // then fills the cell, so it places the picture as the cell would.
++        let fitted_cell_alignment = (self.style.table_columns_min_size
++            && builder.table.in_cell
++            && width.is_none()
++            && height.is_none())
++        .then(|| builder.table.current_cell_alignment());
++
+         let image_element = {
+             let image_start = range.start;
+             let wrapper = div()
+                 .id(("markdown-image-link", range.start))
+                 .debug_selector(move || format!("markdown_image_{image_start}"))
+-                .min_w_0();
++                .min_w_0()
++                .when_some(fitted_cell_alignment, |wrapper, alignment| {
++                    // No width at all to start from, not a share of the
++                    // cell's: a share has no value while the columns are
++                    // still being sized, and counts as the content's width.
++                    let wrapper = wrapper.flex_grow(1.).flex_basis(px(0.)).flex();
++                    match alignment {
++                        Some(Alignment::Center) => wrapper.justify_center(),
++                        Some(Alignment::Right) => wrapper.justify_end(),
++                        _ => wrapper.justify_start(),
++                    }
++                });
+             let wrapper = if !self.style.prevent_mouse_interaction
+                 && let Some(url) = enclosing_link_url
+             {
+@@ -2029,6 +2053,7 @@ impl MarkdownElement {
+             wrapper.child(
+                 img(source)
+                     .id(("markdown-image", range.start))
++                    .debug_selector(move || format!("markdown_image_content_{image_start}"))
+                     .min_w_0()
+                     .max_w_full()
+                     .rounded_md()
+@@ -6854,6 +6879,125 @@ mod tests {
+         }
+     }
+ 
++    /// A table told to fit its container shares the width between its
++    /// columns, so a picture in a cell has to shrink to its column, in
++    /// proportion, however wide it is in pixels. Left at its own width it
++    /// would set the column's least width and push the table off the side.
++    #[gpui::test]
++    fn test_images_in_a_fitted_table_shrink_to_their_columns(cx: &mut TestAppContext) {
++        struct FittedTableView {
++            markdown: Entity<Markdown>,
++            screenshot: Arc<RenderImage>,
++            icon: Arc<RenderImage>,
++        }
++
++        impl Render for FittedTableView {
++            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++                let screenshot = self.screenshot.clone();
++                let icon = self.icon.clone();
++                let style = MarkdownStyle {
++                    table_columns_min_size: true,
++                    ..Default::default()
++                };
++                div().size_full().child(
++                    MarkdownElement::new(self.markdown.clone(), style).image_resolver(
++                        move |dest_url, _| {
++                            Some(ImageSource::Render(match dest_url {
++                                "icon.png" => icon.clone(),
++                                _ => screenshot.clone(),
++                            }))
++                        },
++                    ),
++                )
++            }
++        }
++
++        const WINDOW_WIDTH: f32 = 800.;
++        let source = "| Before | After | Note |\n\
++                      |---|---|:---:|\n\
++                      | ![](before.png) | ![](after.png) | ![](icon.png) |";
++        ensure_theme_initialized(cx);
++        let render_svg = |svg: &'static [u8], cx: &mut TestAppContext| {
++            cx.update(|cx| {
++                cx.svg_renderer()
++                    .render_single_frame(svg, 1.0)
++                    .expect("test svg should render")
++            })
++        };
++        let screenshot = render_svg(
++            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900"></svg>"#,
++            cx,
++        );
++        let icon = render_svg(
++            br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"#,
++            cx,
++        );
++        let window = cx.open_window(size(px(WINDOW_WIDTH), px(600.)), |_, cx| {
++            let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
++            FittedTableView {
++                markdown,
++                screenshot,
++                icon,
++            }
++        });
++        cx.run_until_parked();
++        let mut cx = VisualTestContext::from_window(window.into(), cx);
++        let selectors = image_selectors(source);
++        let [before, after, icon] = selectors.as_slice() else {
++            panic!("expected three images, found {}", selectors.len());
++        };
++
++        let table = cx
++            .debug_bounds("markdown_table")
++            .expect("table should be rendered");
++        assert!(
++            table.size.width <= px(WINDOW_WIDTH),
++            "the table should fit the window: {table:?}"
++        );
++        for (image, cell) in [
++            (before, "markdown_table_cell_0_0"),
++            (after, "markdown_table_cell_0_1"),
++        ] {
++            let image = cx.debug_bounds(image).expect("image should be rendered");
++            let cell = cx.debug_bounds(cell).expect("cell should be rendered");
++            assert!(
++                image.left() >= cell.left() && image.right() <= cell.right(),
++                "the screenshot should stay inside its cell: image {image:?}, cell {cell:?}"
++            );
++            assert!(
++                image.size.width > px(100.) && image.size.width < px(WINDOW_WIDTH / 2.),
++                "the screenshot should take a column's share of the width: {image:?}"
++            );
++            // 1440 by 900 is 8 by 5; the wrapper adds the picture's small margin.
++            let expected_height = image.size.width * (900. / 1440.);
++            assert!(
++                (image.size.height - expected_height).abs() < px(8.),
++                "the screenshot should keep its proportions: {image:?}"
++            );
++        }
++
++        // A small picture is not stretched, and still follows its column's
++        // alignment, though its wrapper now fills the cell.
++        let icon = icon
++            .replace("markdown_image_", "markdown_image_content_")
++            .leak();
++        let icon = cx.debug_bounds(icon).expect("icon should be rendered");
++        let cell = cx
++            .debug_bounds("markdown_table_cell_0_2")
++            .expect("cell should be rendered");
++        let left_gap = icon.left() - cell.left();
++        let right_gap = cell.right() - icon.right();
++        assert!(
++            icon.size.width < px(20.) && icon.size.height < px(20.),
++            "the icon should keep its own size: {icon:?}"
++        );
++        // The picture's right margin is part of what is centered.
++        assert!(
++            (left_gap - right_gap).abs() <= px(5.) && left_gap > px(100.),
++            "the icon should be centered in its column: left gap {left_gap:?}, right gap {right_gap:?}"
++        );
++    }
++
+     #[test]
+     fn test_collect_image_alt_text() {
+         let alt_text = |markdown: &str| {
+-- 
+2.54.0 (Apple Git-157)
+

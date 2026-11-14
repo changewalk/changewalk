@@ -1,0 +1,738 @@
+From 973689238f1f931553616ed39d8e58b84ea020d6 Mon Sep 17 00:00:00 2001
+From: Jack Walters <jackwalterswork@gmail.com>
+Date: Sat, 14 Nov 2026 15:55:56 +0000
+Subject: [PATCH 11/12] git_ui: Draw the pictures in a merge request's
+ description
+
+A description's pictures showed only as their link text. GitLab writes a
+link to a file uploaded to the project as /uploads/<secret>/<name>, which
+is no address by itself and needs the user's login to fetch, so the
+markdown could not load it. Each such picture is now fetched once through
+glab when the merge request loads, kept in the review cache for a month,
+and drawn from its file as it arrives, in a table cell or an img tag
+alike. A picture elsewhere on the web is loaded from its address. A video
+keeps its link text, since it cannot be drawn.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/git_ui/src/branch_diff.rs      | 107 +++++++++++++
+ crates/git_ui/src/diff_multibuffer.rs | 176 ++++++++++++++++++++-
+ crates/git_ui/src/gitlab_review.rs    | 212 +++++++++++++++++++++++++-
+ crates/git_ui/src/review_cache.rs     |  40 ++++-
+ 4 files changed, 526 insertions(+), 9 deletions(-)
+
+diff --git a/crates/git_ui/src/branch_diff.rs b/crates/git_ui/src/branch_diff.rs
+index e62111bfe6..59afbbe800 100644
+--- a/crates/git_ui/src/branch_diff.rs
++++ b/crates/git_ui/src/branch_diff.rs
+@@ -1817,6 +1817,113 @@ mod tests {
+         assert!(cx.debug_bounds("general-thread-new").is_some());
+     }
+ 
++    /// A picture in the description that is one of the project's uploads
++    /// is drawn from the file it was fetched to, in a table cell as GitLab
++    /// lays screenshots out. One not fetched leaves its link's text.
++    #[gpui::test]
++    async fn test_description_draws_fetched_uploads(cx: &mut TestAppContext) {
++        use crate::gitlab_review::Upload;
++
++        // A 40 by 20 PNG, all one colour.
++        const PICTURE: &[u8] = &[
++            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 40, 0, 0, 0, 20,
++            8, 2, 0, 0, 0, 112, 36, 232, 236, 0, 0, 0, 36, 73, 68, 65, 84, 120, 218, 99, 56, 97,
++            99, 51, 32, 136, 97, 212, 226, 81, 139, 71, 45, 30, 181, 120, 212, 226, 81, 139, 71,
++            45, 30, 181, 120, 228, 88, 12, 0, 100, 11, 232, 46, 205, 155, 202, 211, 0, 0, 0, 0, 73,
++            69, 78, 68, 174, 66, 96, 130,
++        ];
++
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({
++                ".git": {},
++                "a.txt": "C",
++            }),
++        )
++        .await;
++        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        let branch_diff = cx
++            .update(|window, cx| {
++                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
++            })
++            .await
++            .unwrap();
++        workspace.update_in(cx, |workspace, window, cx| {
++            workspace.add_item_to_active_pane(
++                Box::new(branch_diff.clone()),
++                None,
++                true,
++                window,
++                cx,
++            );
++        });
++        fs.set_head_for_repo(
++            Path::new(path!("/project/.git")),
++            &[("a.txt", "B".into())],
++            "sha",
++        );
++        fs.set_merge_base_content_for_repo(
++            Path::new(path!("/project/.git")),
++            &[("a.txt", "A".into())],
++        );
++        cx.run_until_parked();
++
++        let folder = std::env::temp_dir().join(format!("zed-review-test-{}", std::process::id()));
++        std::fs::create_dir_all(&folder).unwrap();
++        let file = folder.join("before.png");
++        std::fs::write(&file, PICTURE).unwrap();
++        let secret = "d2e7a29c38a866c962c5cab82b22f0c9";
++        let text = format!(
++            "| Before | After |\n|---|---|\n\
++             | ![before](/uploads/{secret}/before.png) | ![after](/uploads/{secret}/after.png) |\n"
++        );
++        // The markdown names each picture it draws by where its link starts.
++        let drawn = |link: &str| -> &'static str {
++            let start = text.find(link).unwrap();
++            Box::leak(format!("markdown_image_{start}").into_boxed_str())
++        };
++
++        let diff = branch_diff.read_with(cx, |branch_diff, _| branch_diff.diff.clone());
++        diff.update(cx, |diff, cx| {
++            diff.show_merge_request_for_test(cx);
++            diff.show_description_for_test(
++                &text,
++                vec![(
++                    Upload {
++                        secret: secret.into(),
++                        file_name: "before.png".into(),
++                    },
++                    file,
++                )],
++                cx,
++            );
++        });
++        cx.run_until_parked();
++
++        let before = cx
++            .debug_bounds(drawn("![before]"))
++            .expect("the fetched picture is drawn");
++        // The picture's own 40 by 20 and its margin: the text that stands
++        // in for a picture that failed to load would be far wider.
++        assert!(
++            before.size.width >= px(40.) && before.size.width < px(50.),
++            "{before:?}"
++        );
++        assert!(
++            before.size.height >= px(20.) && before.size.height < px(30.),
++            "{before:?}"
++        );
++        assert!(cx.debug_bounds(drawn("![after]")).is_none());
++
++        std::fs::remove_dir_all(&folder).ok();
++    }
++
+     #[gpui::test]
+     async fn test_branch_diff_action_matches_existing_item_by_base_ref(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/git_ui/src/diff_multibuffer.rs b/crates/git_ui/src/diff_multibuffer.rs
+index a0ee4fe331..b3e263ad2c 100644
+--- a/crates/git_ui/src/diff_multibuffer.rs
++++ b/crates/git_ui/src/diff_multibuffer.rs
+@@ -4,7 +4,7 @@ use crate::{
+     git_panel_settings::GitPanelSettings,
+     gitlab_review::{
+         self, Approvals, GeneralDiscussion, GitLabComment, RelatedIssue, RemoteDiscussion,
+-        RemoteNote, RemoteThreads, ReviewerStanding, ReviewerState,
++        RemoteNote, RemoteThreads, ReviewerStanding, ReviewerState, Upload,
+     },
+     review_cache::{self, LastReview},
+     review_order::{
+@@ -31,8 +31,8 @@ use futures_lite::future::yield_now;
+ use git::{repository::RepoPath, status::FileStatus};
+ use gpui::{
+     AnyElement, App, AppContext as _, AsyncWindowContext, DragMoveEvent, Entity, EventEmitter,
+-    FocusHandle, Focusable, FontWeight, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Render,
+-    SharedString, Subscription, Task, WeakEntity,
++    FocusHandle, Focusable, FontWeight, ImageSource, MouseButton, MouseDownEvent, MouseUpEvent,
++    Pixels, Render, Resource, SharedString, SharedUri, Subscription, Task, WeakEntity,
+ };
+ use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point, ToPoint as _};
+ use language_model::{
+@@ -52,7 +52,7 @@ use project::{
+     },
+ };
+ use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
+-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
++use std::{collections::BTreeMap, fmt::Write as _, path::Path, sync::Arc};
+ use theme::ActiveTheme;
+ use ui::{CommonAnimationExt as _, KeyBinding, Tooltip, prelude::*};
+ use util::{ResultExt as _, rel_path::RelPath};
+@@ -95,6 +95,8 @@ pub struct DiffMultibuffer {
+     merge_request: Option<MergeRequestHeader>,
+     _merge_request_task: Option<Task<()>>,
+     _merge_request_details_task: Option<Task<()>>,
++    /// The pictures of the description on their way from GitLab.
++    _description_images_task: Option<Task<()>>,
+     _review_threads_task: Option<Task<()>>,
+     /// The threads, asked for as soon as the merge request is known so they
+     /// are ready by the time the files are.
+@@ -137,6 +139,9 @@ struct MergeRequestHeader {
+     head_sha: Option<String>,
+     description: Option<Entity<Markdown>>,
+     description_text: Option<String>,
++    /// The pictures the description links to among the project's uploads,
++    /// each by the file it was fetched to. One still on its way is absent.
++    description_images: Arc<HashMap<Upload, Arc<Path>>>,
+     expanded: bool,
+     /// The height the user dragged the description to; the default until
+     /// they do.
+@@ -151,6 +156,12 @@ struct MergeRequestHeader {
+ }
+ 
+ impl MergeRequestHeader {
++    /// The project's address, which the merge request's own starts with.
++    fn project_url(&self) -> Option<&str> {
++        let (project_url, _) = self.web_url.split_once("/-/")?;
++        Some(project_url)
++    }
++
+     /// What the prompts are told about the merge request.
+     fn prompt_context(&self) -> String {
+         let mut context = format!("Title: {}\n", self.title);
+@@ -425,6 +436,7 @@ impl DiffMultibuffer {
+             merge_request: None,
+             _merge_request_task: None,
+             _merge_request_details_task: None,
++            _description_images_task: None,
+             _review_threads_task: None,
+             prefetched_discussions: None,
+             _thread_refresh_task: None,
+@@ -675,6 +687,7 @@ impl DiffMultibuffer {
+     pub(crate) fn reset_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+         self._merge_request_task.take();
+         self._merge_request_details_task.take();
++        self._description_images_task.take();
+         self._review_threads_task.take();
+         self._thread_refresh_task.take();
+         self._review_action_task.take();
+@@ -785,6 +798,7 @@ impl DiffMultibuffer {
+                     web_url: merge_request.web_url.into(),
+                     description,
+                     description_text,
++                    description_images: Arc::default(),
+                     expanded: true,
+                     description_height: None,
+                     description_drag: None,
+@@ -793,6 +807,7 @@ impl DiffMultibuffer {
+                     reviewer: None,
+                     last_review,
+                 });
++                this.load_description_images(cx);
+                 this.load_merge_request_details(cx);
+                 this.prefetch_discussions(cx);
+                 cx.notify();
+@@ -804,6 +819,72 @@ impl DiffMultibuffer {
+     /// Fetches what the header shows besides the description: the linked
+     /// issues, who approved, and the user's own reviewer state. Each is
+     /// optional, so a failure only logs.
++    /// Fetches the pictures the description links to among the project's
++    /// uploads. Those links need the user's login, so the markdown cannot
++    /// load them by itself; each is fetched once through `glab`, kept in
++    /// the review cache, and drawn from its file as it arrives.
++    fn load_description_images(&mut self, cx: &mut Context<Self>) {
++        const CONCURRENT_DOWNLOADS: usize = 4;
++
++        let Some(work_dir) = self.work_dir(cx) else {
++            return;
++        };
++        let Some(text) = self
++            .merge_request
++            .as_ref()
++            .and_then(|header| header.description_text.as_deref())
++        else {
++            return;
++        };
++        let uploads: Vec<Upload> = Upload::all_in(text)
++            .into_iter()
++            .filter(Upload::is_image)
++            .collect();
++        if uploads.is_empty() {
++            return;
++        }
++        let (fetched_tx, mut fetched_rx) = futures::channel::mpsc::unbounded();
++        let fetch = cx.background_spawn(async move {
++            review_cache::prune_uploads();
++            stream::iter(uploads)
++                .for_each_concurrent(CONCURRENT_DOWNLOADS, |upload| {
++                    let work_dir = work_dir.clone();
++                    let fetched_tx = fetched_tx.clone();
++                    async move {
++                        let file = review_cache::upload_file(&upload.cache_file_name());
++                        let fetched = if file.exists() {
++                            Ok(())
++                        } else {
++                            gitlab_review::download_upload(&work_dir, &upload, &file).await
++                        };
++                        fetched_tx.unbounded_send((upload, file, fetched)).ok();
++                    }
++                })
++                .await;
++        });
++        self._description_images_task = Some(cx.spawn(async move |this, cx| {
++            let _fetch = fetch;
++            while let Some((upload, file, fetched)) = fetched_rx.next().await {
++                if let Err(error) = fetched {
++                    log::warn!(
++                        "could not fetch the picture {} of the description: {error:#}",
++                        upload.file_name
++                    );
++                    continue;
++                }
++                let shown = this.update(cx, |this, cx| {
++                    if let Some(header) = this.merge_request.as_mut() {
++                        Arc::make_mut(&mut header.description_images).insert(upload, file.into());
++                        cx.notify();
++                    }
++                });
++                if shown.is_err() {
++                    break;
++                }
++            }
++        }));
++    }
++
+     fn load_merge_request_details(&mut self, cx: &mut Context<Self>) {
+         let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+             return;
+@@ -1091,6 +1172,13 @@ impl DiffMultibuffer {
+                                     markdown,
+                                     editor::hover_markdown_style(window, cx),
+                                 )
++                                .image_resolver({
++                                    let project_url = header.project_url().map(str::to_string);
++                                    let uploads = header.description_images.clone();
++                                    move |link, _| {
++                                        description_image(link, project_url.as_deref(), &uploads)
++                                    }
++                                })
+                                 .code_block_renderer(
+                                     CodeBlockRenderer::Default {
+                                         copy_button_visibility:
+@@ -2895,6 +2983,7 @@ impl DiffMultibuffer {
+             head_sha: None,
+             description: None,
+             description_text: None,
++            description_images: Arc::default(),
+             expanded: true,
+             description_height: None,
+             description_drag: None,
+@@ -2906,6 +2995,39 @@ impl DiffMultibuffer {
+         cx.notify();
+     }
+ 
++    /// Shows `text` as the description, with these uploads already fetched.
++    #[cfg(test)]
++    pub(crate) fn show_description_for_test(
++        &mut self,
++        text: &str,
++        images: Vec<(Upload, std::path::PathBuf)>,
++        cx: &mut Context<Self>,
++    ) {
++        let markdown = cx.new(|cx| {
++            Markdown::new_with_options(
++                text.to_string().into(),
++                None,
++                None,
++                MarkdownOptions {
++                    parse_html: true,
++                    ..Default::default()
++                },
++                cx,
++            )
++        });
++        if let Some(header) = self.merge_request.as_mut() {
++            header.description = Some(markdown);
++            header.description_text = Some(text.to_string());
++            header.description_images = Arc::new(
++                images
++                    .into_iter()
++                    .map(|(upload, file)| (upload, file.into()))
++                    .collect(),
++            );
++        }
++        cx.notify();
++    }
++
+     /// Each thread on the merge request itself: its id, whether it is
+     /// resolved, whether it is shown in full, and its notes' texts.
+     #[cfg(test)]
+@@ -4485,6 +4607,24 @@ fn render_review_note(
+         .into_any_element()
+ }
+ 
++/// What to draw for an image link in a description. An upload of the
++/// project is drawn from the file it was fetched to; while it is on its
++/// way there is nothing to draw, and the markdown shows the link's text.
++/// Any other picture on the web is loaded from its address.
++fn description_image(
++    link: &str,
++    project_url: Option<&str>,
++    uploads: &HashMap<Upload, Arc<Path>>,
++) -> Option<ImageSource> {
++    if let Some(upload) = Upload::from_link(link, project_url) {
++        return uploads
++            .get(&upload)
++            .map(|file| ImageSource::from(file.clone()));
++    }
++    (link.starts_with("https://") || link.starts_with("http://"))
++        .then(|| ImageSource::Resource(Resource::Uri(SharedUri::from(link.to_string()))))
++}
++
+ /// The first line of a note, cut short, for a thread folded to one line.
+ fn preview_of(body: &str) -> String {
+     let first_line = body.lines().next().unwrap_or_default().trim();
+@@ -4739,6 +4879,34 @@ mod tests {
+     use super::*;
+     use time::macros::{datetime, offset};
+ 
++    /// A link to one of the project's uploads is drawn from its fetched
++    /// file, and not at all until it is fetched; the web would refuse it
++    /// without the login.
++    #[test]
++    fn a_description_image_comes_from_its_fetched_file() {
++        let project = Some("https://gitlab.example/group/project");
++        let upload = Upload {
++            secret: "d2e7a29c38a866c962c5cab82b22f0c9".into(),
++            file_name: "shot.png".into(),
++        };
++        let link = "/uploads/d2e7a29c38a866c962c5cab82b22f0c9/shot.png";
++        let file: Arc<Path> = Path::new("/cache/shot.png").into();
++
++        assert!(description_image(link, project, &HashMap::default()).is_none());
++        let fetched = HashMap::from_iter([(upload, file.clone())]);
++        match description_image(link, project, &fetched) {
++            Some(ImageSource::Resource(Resource::Path(path))) => assert_eq!(path, file),
++            _ => panic!("the upload should be drawn from its file"),
++        }
++        match description_image("https://example.com/badge.svg", project, &fetched) {
++            Some(ImageSource::Resource(Resource::Uri(uri))) => {
++                assert_eq!(uri.as_ref(), "https://example.com/badge.svg")
++            }
++            _ => panic!("a picture on the web should be loaded from its address"),
++        }
++        assert!(description_image("docs/shot.png", project, &fetched).is_none());
++    }
++
+     /// A note's time is worded by the day it was written on in the reader's
+     /// own time zone, which is not always the day GitLab's UTC stamp names.
+     #[test]
+diff --git a/crates/git_ui/src/gitlab_review.rs b/crates/git_ui/src/gitlab_review.rs
+index 7349938107..00ae0b46e3 100644
+--- a/crates/git_ui/src/gitlab_review.rs
++++ b/crates/git_ui/src/gitlab_review.rs
+@@ -410,6 +410,118 @@ fn parse_started_discussion(text: &str) -> Result<GeneralDiscussion> {
+     })
+ }
+ 
++/// A file uploaded to the project, as a description or a note links to it.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub struct Upload {
++    /// The random folder GitLab keeps the file under.
++    pub secret: String,
++    /// The file's name as the link writes it, percent-encoded if the link is.
++    pub file_name: String,
++}
++
++/// What a link to an upload starts with, after the project's address.
++const UPLOADS_PREFIX: &str = "/uploads/";
++
++impl Upload {
++    /// The upload `link` points at. GitLab writes a link to a file of the
++    /// same project as `/uploads/<secret>/<name>`; the same under the
++    /// project's own address counts too. Any other link is not an upload.
++    pub fn from_link(link: &str, project_url: Option<&str>) -> Option<Self> {
++        let path = project_url
++            .and_then(|project_url| link.strip_prefix(project_url.trim_end_matches('/')))
++            .unwrap_or(link);
++        let (upload, length) = Self::parse(path.strip_prefix(UPLOADS_PREFIX)?)?;
++        (UPLOADS_PREFIX.len() + length == path.len()).then_some(upload)
++    }
++
++    /// Every upload linked in `text`, each once, in the order they appear.
++    pub fn all_in(text: &str) -> Vec<Self> {
++        let mut uploads = Vec::new();
++        let mut rest = text;
++        while let Some(start) = rest.find(UPLOADS_PREFIX) {
++            rest = &rest[start + UPLOADS_PREFIX.len()..];
++            if let Some((upload, length)) = Self::parse(rest) {
++                rest = &rest[length..];
++                if !uploads.contains(&upload) {
++                    uploads.push(upload);
++                }
++            }
++        }
++        uploads
++    }
++
++    /// Reads `<secret>/<name>` off the front of `text`, and says how much
++    /// of it that was. The name ends where a markdown or HTML link would.
++    fn parse(text: &str) -> Option<(Self, usize)> {
++        let (secret, after) = text.split_once('/')?;
++        if secret.len() < 16 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++            return None;
++        }
++        let end = after
++            .find(|character: char| {
++                character.is_whitespace() || matches!(character, ')' | '"' | '\'' | '<' | '>')
++            })
++            .unwrap_or(after.len());
++        let file_name = &after[..end];
++        if file_name.is_empty() || file_name.contains('/') || matches!(file_name, "." | "..") {
++            return None;
++        }
++        Some((
++            Self {
++                secret: secret.to_string(),
++                file_name: file_name.to_string(),
++            },
++            secret.len() + 1 + end,
++        ))
++    }
++
++    /// Whether the file is a picture, going by its name. GitLab shows a
++    /// video the same way in markdown, which cannot be drawn here.
++    pub fn is_image(&self) -> bool {
++        let extension = self
++            .file_name
++            .rsplit_once('.')
++            .map(|(_, extension)| extension.to_ascii_lowercase());
++        matches!(
++            extension.as_deref(),
++            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
++        )
++    }
++
++    /// A name for the fetched file that is safe on every file system and
++    /// keeps the extension, which says what kind of picture it is.
++    pub fn cache_file_name(&self) -> String {
++        let name: String = self
++            .file_name
++            .chars()
++            .map(|character| {
++                if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
++                    character
++                } else {
++                    '_'
++                }
++            })
++            .collect();
++        format!("{}-{name}", self.secret)
++    }
++}
++
++/// Fetches `upload` into `file`. A link to an upload needs the user's
++/// login, which `glab` has. The bytes go to a neighbouring file first, so a
++/// half-written one is never found under the final name.
++pub async fn download_upload(work_dir: &Path, upload: &Upload, file: &Path) -> Result<()> {
++    let endpoint = format!(
++        "projects/:id/uploads/{}/{}",
++        upload.secret, upload.file_name
++    );
++    let bytes = glab_api_bytes(work_dir, "GET", &endpoint, None).await?;
++    let folder = file.parent().context("the upload has no folder to go in")?;
++    std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
++    let partial = folder.join(format!("{}.part", upload.cache_file_name()));
++    std::fs::write(&partial, bytes).with_context(|| format!("writing {}", partial.display()))?;
++    std::fs::rename(&partial, file).with_context(|| format!("writing {}", file.display()))
++}
++
+ /// Gives or withdraws the current user's approval.
+ pub async fn set_approval(work_dir: PathBuf, iid: u64, approve: bool) -> Result<()> {
+     let action = if approve { "approve" } else { "unapprove" };
+@@ -1038,6 +1150,18 @@ async fn glab_api(
+     endpoint: &str,
+     body: Option<&str>,
+ ) -> Result<String> {
++    let reply = glab_api_bytes(work_dir, method, endpoint, body).await?;
++    String::from_utf8(reply).context("`glab` replied with invalid UTF-8")
++}
++
++/// Runs `glab api` in `work_dir` and returns the response body as it came,
++/// which for a file is not text.
++async fn glab_api_bytes(
++    work_dir: &Path,
++    method: &str,
++    endpoint: &str,
++    body: Option<&str>,
++) -> Result<Vec<u8>> {
+     let mut command = new_command("glab");
+     command
+         .args(["api", "--method", method, endpoint])
+@@ -1076,7 +1200,7 @@ async fn glab_api(
+                 .join("\n")
+         );
+     }
+-    String::from_utf8(output.stdout).context("`glab` replied with invalid UTF-8")
++    Ok(output.stdout)
+ }
+ 
+ /// Runs a GraphQL `query` through `glab api graphql` and returns the reply.
+@@ -1445,6 +1569,92 @@ index 1111111..2222222 100644
+         assert!(failed.is_err());
+     }
+ 
++    #[test]
++    fn upload_links_are_told_from_other_links() {
++        let secret = "d2e7a29c38a866c962c5cab82b22f0c9";
++        let upload = Upload {
++            secret: secret.into(),
++            file_name: "share-at-creation.png".into(),
++        };
++        let project = Some("https://gitlab.example/group/project");
++
++        assert_eq!(
++            Upload::from_link(&format!("/uploads/{secret}/share-at-creation.png"), project),
++            Some(upload.clone())
++        );
++        assert_eq!(
++            Upload::from_link(
++                &format!(
++                    "https://gitlab.example/group/project/uploads/{secret}/share-at-creation.png"
++                ),
++                project
++            ),
++            Some(upload.clone())
++        );
++        // Another project's upload cannot be fetched as this project's.
++        assert_eq!(
++            Upload::from_link(
++                &format!("https://gitlab.example/other/project/uploads/{secret}/a.png"),
++                project
++            ),
++            None
++        );
++        assert_eq!(
++            Upload::from_link("https://example.com/badge.svg", project),
++            None
++        );
++        assert_eq!(
++            Upload::from_link("/uploads/not-a-secret/a.png", project),
++            None
++        );
++        assert_eq!(
++            Upload::from_link(&format!("/uploads/{secret}/folder/a.png"), project),
++            None
++        );
++        assert_eq!(
++            Upload::from_link(&format!("/uploads/{secret}/.."), project),
++            None
++        );
++
++        assert!(upload.is_image());
++        let video = Upload {
++            secret: secret.into(),
++            file_name: "After%20the%20fix.MOV".into(),
++        };
++        assert!(!video.is_image());
++        assert_eq!(
++            video.cache_file_name(),
++            format!("{secret}-After_20the_20fix.MOV")
++        );
++    }
++
++    #[test]
++    fn uploads_are_found_in_markdown_tables_and_html() {
++        let first = "d2e7a29c38a866c962c5cab82b22f0c9";
++        let second = "7c8e7f5dd6837c33a0171096a6741065";
++        let text = format!(
++            "| Before | After |\n|---|---|\n\
++             | ![before](/uploads/{first}/before.png) | ![after](/uploads/{second}/after.png \"The fix\") |\n\n\
++             <img src=\"/uploads/{first}/before.png\" width=\"300\">\n\
++             See /uploads/short/nothing.png and the end /uploads/{second}/"
++        );
++
++        assert_eq!(
++            Upload::all_in(&text),
++            vec![
++                Upload {
++                    secret: first.into(),
++                    file_name: "before.png".into()
++                },
++                Upload {
++                    secret: second.into(),
++                    file_name: "after.png".into()
++                },
++            ]
++        );
++        assert_eq!(Upload::all_in("No uploads here."), Vec::new());
++    }
++
+     #[test]
+     fn project_path_comes_off_the_web_url() {
+         assert_eq!(
+diff --git a/crates/git_ui/src/review_cache.rs b/crates/git_ui/src/review_cache.rs
+index 34d591e4a4..3471b43685 100644
+--- a/crates/git_ui/src/review_cache.rs
++++ b/crates/git_ui/src/review_cache.rs
+@@ -1,10 +1,10 @@
+ //! What the review flow remembers between sessions: the order and notes a
+-//! model wrote for a given diff, and when the user last reviewed a merge
+-//! request.
++//! model wrote for a given diff, when the user last reviewed a merge
++//! request, and the pictures its description links to.
+ //!
+-//! Everything is a small JSON file under Zed's data directory, so a diff
++//! The first two are small JSON files under Zed's data directory, so a diff
+ //! reopened at the same commit shows its order at once instead of asking the
+-//! model again.
++//! model again. The pictures are the files GitLab served, kept a month.
+ 
+ use crate::review_order::{ReviewNote, ReviewOrder, ReviewOrderEntry};
+ use anyhow::{Context as _, Result};
+@@ -39,6 +39,38 @@ fn write<T: Serialize>(file: &Path, value: &T) -> Result<()> {
+     std::fs::write(file, text).with_context(|| format!("writing {}", file.display()))
+ }
+ 
++/// How long a fetched upload is kept. One still wanted after that is
++/// fetched again.
++const UPLOADS_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
++
++fn uploads_dir() -> PathBuf {
++    cache_dir().join("uploads")
++}
++
++/// Where the upload with this cache name is kept once fetched.
++pub(crate) fn upload_file(cache_file_name: &str) -> PathBuf {
++    uploads_dir().join(cache_file_name)
++}
++
++/// Removes the uploads fetched longer ago than they are kept for, so the
++/// folder does not grow with every merge request ever read.
++pub(crate) fn prune_uploads() {
++    let Ok(entries) = std::fs::read_dir(uploads_dir()) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let old = entry
++            .metadata()
++            .and_then(|metadata| metadata.modified())
++            .ok()
++            .and_then(|modified| modified.elapsed().ok())
++            .is_some_and(|age| age > UPLOADS_KEPT_FOR);
++        if old {
++            std::fs::remove_file(entry.path()).ok();
++        }
++    }
++}
++
+ #[derive(Serialize, Deserialize)]
+ struct CachedOrder {
+     entries: Vec<CachedEntry>,
+-- 
+2.54.0 (Apple Git-157)
+

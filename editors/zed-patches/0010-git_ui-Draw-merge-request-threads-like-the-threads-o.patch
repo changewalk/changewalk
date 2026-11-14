@@ -1,7 +1,7 @@
 From f812dfe28464b784c43b79df2f996469f4f3b491 Mon Sep 17 00:00:00 2001
 From: Jack Walters <jackwalterswork@gmail.com>
 Date: Sat, 14 Nov 2026 15:24:14 +0000
-Subject: [PATCH 10/10] git_ui: Draw merge request threads like the threads on
+Subject: [PATCH 10/12] git_ui: Draw merge request threads like the threads on
  lines
 
 A thread on the merge request itself had its own look, with Reply and
