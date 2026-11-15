@@ -1,14 +1,7 @@
-// The hand-off the CLI writes before it launches the editor.
-//
-// Today the CLI writes a single change in GitLab's shape (see the Rust
-// `MergeRequest` in `cli/src/forge.rs`) to a temp file, and passes that
-// file's path as the `mr` query of the launch URL. This module reads only
-// the fields the thin client needs.
-//
-// The `review` field is not written yet. It is the shared payload the CLI
-// review engine will add in a later phase (threads, reading order, notes,
-// summary). The types are declared now so the renderer can light up each
-// part as the CLI starts to send it, without a format change here.
+// The hand-off the CLI writes before it launches the editor: the change in
+// GitLab's shape (see the Rust `MergeRequest` in `cli/src/forge.rs`), plus a
+// `review` field with the model's reading order and notes when the CLI has
+// them. Only the fields the extension reads are declared here.
 
 import { promises as fs } from "fs";
 
@@ -19,36 +12,32 @@ export interface Author {
   username?: string;
 }
 
+/** A note the model left on one line of a file. */
+export interface ReviewNote {
+  /** Line in the new (right) side of the file, 1-based. */
+  line: number;
+  text: string;
+}
+
 /** One changed file, in the order the review should read it. */
 export interface OrderedFile {
   path: string;
-  /** Why this file is placed here, shown as a guiding note. Optional. */
-  note?: string;
+  /** Why the file is placed here, one short sentence. */
+  reason?: string;
+  notes?: ReviewNote[];
 }
 
-/** One review thread, anchored to a file and line in the diff. */
-export interface ReviewThread {
-  id: string;
-  path: string;
-  /** Line in the new (right) side of the diff, 1-based. */
-  line: number;
-  resolved: boolean;
-  comments: ReviewComment[];
+export interface DiffRefs {
+  base_sha: string;
+  head_sha: string;
+  start_sha: string;
 }
 
-export interface ReviewComment {
-  author: string;
-  body: string;
-  /** RFC 3339. */
-  at: string;
-}
-
-/** The shared review payload the CLI engine will add. All optional, so the
- *  renderer degrades to a plain ordered diff when a part is absent. */
+/** The reading order and summary. All optional: the renderer degrades to a
+ *  plain diff when a part is absent. */
 export interface ReviewPayload {
   order?: OrderedFile[];
   summary?: string;
-  threads?: ReviewThread[];
 }
 
 export interface Handoff {
@@ -60,9 +49,15 @@ export interface Handoff {
   target_branch: string;
   web_url: string;
   forge: Forge;
+  /** The clone the change belongs to. */
+  repo?: string;
   additions?: number;
   deletions?: number;
   comment_count?: number;
+  approved_by?: string[];
+  user_has_approved?: boolean;
+  /** Present on a single change; the commits the diff is between. */
+  diff_refs?: DiffRefs | null;
   review?: ReviewPayload;
 }
 

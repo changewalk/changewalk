@@ -55,9 +55,16 @@ function makeFixture(): { repo: string; handoff: string } {
 async function main(): Promise<void> {
   const extensionDevelopmentPath = path.resolve(__dirname, "../..");
   const extensionTestsPath = path.resolve(__dirname, "./suite/index");
-  const { repo, handoff } = makeFixture();
+  // CW_E2E_REPO and CW_E2E_HANDOFF point the test at a real clone and the
+  // hand-off the CLI wrote, so the same assertions run against a live PR.
+  const { repo, handoff } =
+    process.env.CW_E2E_REPO && process.env.CW_E2E_HANDOFF
+      ? { repo: process.env.CW_E2E_REPO, handoff: process.env.CW_E2E_HANDOFF }
+      : makeFixture();
   try {
     await runTests({
+      // CW_VSCODE_EXEC runs the test host on another VS Code build (e.g. Cursor).
+      ...(process.env.CW_VSCODE_EXEC ? { vscodeExecutablePath: process.env.CW_VSCODE_EXEC } : {}),
       extensionDevelopmentPath,
       extensionTestsPath,
       // Open the clone as the workspace; disable other installed extensions

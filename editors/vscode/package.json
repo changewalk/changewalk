@@ -26,8 +26,92 @@
       {
         "command": "changewalk.openReviewFromFile",
         "title": "changewalk: Open a review from a hand-off file"
+      },
+      {
+        "command": "changewalk.postReview",
+        "title": "changewalk: Post the review, with a verdict",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.approve",
+        "title": "changewalk: Approve the merge request",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.requestChanges",
+        "title": "changewalk: Request changes on the merge request",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.markReviewed",
+        "title": "changewalk: Mark the change as reviewed",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.replyToThread",
+        "title": "Reply",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.toggleResolved",
+        "title": "Resolve or reopen thread",
+        "enablement": "changewalk.reviewing"
+      },
+      {
+        "command": "changewalk.editComment",
+        "title": "Edit comment",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "changewalk.discardDraft",
+        "title": "Discard draft",
+        "icon": "$(trash)"
       }
-    ]
+    ],
+    "menus": {
+      "comments/commentThread/context": [
+        {
+          "command": "changewalk.replyToThread",
+          "group": "inline@1",
+          "when": "commentController == changewalk"
+        },
+        {
+          "command": "changewalk.toggleResolved",
+          "group": "inline@2",
+          "when": "commentController == changewalk && commentThread =~ /remote/"
+        },
+        {
+          "command": "changewalk.discardDraft",
+          "group": "inline@3",
+          "when": "commentController == changewalk && commentThread == draft"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "changewalk.editComment",
+          "group": "inline@1",
+          "when": "commentController == changewalk && comment =~ /^remote:/"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "changewalk.replyToThread",
+          "when": "false"
+        },
+        {
+          "command": "changewalk.toggleResolved",
+          "when": "false"
+        },
+        {
+          "command": "changewalk.editComment",
+          "when": "false"
+        },
+        {
+          "command": "changewalk.discardDraft",
+          "when": "false"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "node esbuild.js",

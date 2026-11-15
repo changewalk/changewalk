@@ -46,7 +46,12 @@ pub fn open(ide: Ide, merge_request: &MergeRequest, app: &Path) -> Result<String
     if let Some(checkout_warning) = check_out(merge_request)? {
         warning.get_or_insert(checkout_warning);
     }
-    let file = write_merge_request_file(merge_request)?;
+    // An editor that runs no review of its own is given the reading order
+    // and notes too, so it need not call the model.
+    let review = (!ide.runs_review_in_editor())
+        .then(|| crate::warm::review_for_hand_off(merge_request))
+        .flatten();
+    let file = write_merge_request_file(merge_request, review)?;
 
     let mut query = vec![("repo", merge_request.repo.to_string_lossy().into_owned())];
     if let Some(base) = review_base(merge_request) {
@@ -261,14 +266,22 @@ fn remote_was_at(repo: &Path, remote: &str, sha: &str) -> bool {
         .is_ok_and(|log| log.lines().any(|line| line == sha))
 }
 
-/// Writes the change as JSON for Zed to show above the diff, which saves
-/// Zed two round trips to the host. The shape is GitLab's, which is what
-/// the Zed fork reads; a pull request is written in the same shape.
-fn write_merge_request_file(merge_request: &MergeRequest) -> Result<PathBuf> {
+/// Writes the change as JSON for the editor to show above the diff, which
+/// saves the editor two round trips to the host. The shape is GitLab's,
+/// which is what the Zed fork reads; a pull request is written in the same
+/// shape. `review`, when given, goes in as the `review` field.
+fn write_merge_request_file(
+    merge_request: &MergeRequest,
+    review: Option<serde_json::Value>,
+) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join("changewalk");
     std::fs::create_dir_all(&dir).context("creating the temporary directory")?;
     let file = dir.join(format!("{}.json", merge_request.iid));
-    std::fs::write(&file, serde_json::to_string(merge_request)?)
+    let mut value = serde_json::to_value(merge_request)?;
+    if let (Some(review), Some(object)) = (review, value.as_object_mut()) {
+        object.insert("review".into(), review);
+    }
+    std::fs::write(&file, serde_json::to_string(&value)?)
         .with_context(|| format!("writing {}", file.display()))?;
     Ok(file)
 }

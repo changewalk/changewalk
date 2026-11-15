@@ -3,32 +3,32 @@
 // The CLI checks the change's branch out, writes it as JSON, and opens
 //   vscode://changewalk.changewalk/review?repo=<dir>&base=<ref>&mr=<file>
 // (Cursor uses the cursor:// scheme; the handler is the same). We read the
-// hand-off and open an ordered multi-file diff of the change, with its
-// description beside it.
-//
-// Phase 1 renders the diff and description. Review threads, the model's
-// reading order, notes, and summary arrive in the hand-off's `review`
-// payload in a later phase; the renderer already reads `review.order` to
-// order the files, and ignores the rest until it is there.
+// hand-off, open an ordered multi-file diff of the change, and open the review
+// session: threads, notes, drafts, verdicts, and the description panel.
 
 import * as vscode from "vscode";
 import * as path from "path";
-import { Handoff, changeNumber, readHandoff } from "./handoff";
-import { activateGitExtension } from "./git";
-import {
-  ReviewLaunch,
-  changedFiles,
-  fallbackBase,
-  order,
-  parseReviewUri,
-  resolveBase,
-} from "./review";
+import { Handoff, OrderedFile, changeNumber, readHandoff } from "./handoff";
+import { GitApi, activateGitExtension } from "./git";
+import { ReviewLaunch, changedFiles, fallbackBase, order, parseReviewUri, resolveBase } from "./review";
+import { ReviewSession } from "./session";
 
 /** A URI scheme whose content is always empty, for the base side of an
  *  added file's diff. Works the same in VS Code and Cursor. */
 const EMPTY_SCHEME = "changewalk-empty";
 
+/** The review open now. One at a time: opening another replaces it. */
+let active: ReviewSession | undefined;
+let extensionContext: vscode.ExtensionContext | undefined;
+
 export function activate(context: vscode.ExtensionContext): void {
+  extensionContext = context;
+  const run = (fn: (session: ReviewSession) => Promise<void>) => async (): Promise<void> => {
+    if (!active) {
+      throw new Error("no review is open; open one from the CLI first");
+    }
+    await fn(active);
+  };
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(EMPTY_SCHEME, {
       provideTextDocumentContent: () => "",
@@ -52,11 +52,30 @@ export function activate(context: vscode.ExtensionContext): void {
         await openReview({ mr: file }).catch(reportError);
       }
     }),
+    vscode.commands.registerCommand("changewalk.postReview", () => run((s) => s.postReview())().catch(reportError)),
+    vscode.commands.registerCommand("changewalk.approve", () => run((s) => s.verdict("approve"))().catch(reportError)),
+    vscode.commands.registerCommand("changewalk.requestChanges", () =>
+      run((s) => s.verdict("requestChanges"))().catch(reportError),
+    ),
+    vscode.commands.registerCommand("changewalk.markReviewed", () => run((s) => s.markReviewed())().catch(reportError)),
+    vscode.commands.registerCommand("changewalk.replyToThread", (reply: vscode.CommentReply) =>
+      run((s) => s.reply(reply))().catch(reportError),
+    ),
+    vscode.commands.registerCommand("changewalk.toggleResolved", (thread: vscode.CommentThread) =>
+      run((s) => s.toggleResolved(thread))().catch(reportError),
+    ),
+    vscode.commands.registerCommand("changewalk.editComment", (comment: vscode.Comment) =>
+      run((s) => s.editComment(comment))().catch(reportError),
+    ),
+    vscode.commands.registerCommand("changewalk.discardDraft", (thread: vscode.CommentThread) =>
+      run(async (s) => s.discardDraft(thread))().catch(reportError),
+    ),
+    { dispose: () => active?.dispose() },
   );
 }
 
 export function deactivate(): void {
-  // Nothing to tear down; the webview and diffs are owned by VS Code.
+  active?.dispose();
 }
 
 async function handleUri(uri: vscode.Uri): Promise<void> {
@@ -69,18 +88,12 @@ async function openReview(launch: ReviewLaunch): Promise<void> {
   if (!repo) {
     throw new Error("no repository for the review; open the clone, or launch from the CLI");
   }
-
-  await showDescription(handoff);
-  await openDiff(handoff, repo, launch.base);
-}
-
-async function openDiff(handoff: Handoff, repo: string, base: string | undefined): Promise<void> {
   const git = await activateGitExtension();
   if (!git) {
     throw new Error("VS Code's Git extension is not available; cannot show the diff");
   }
 
-  const baseRef = base ?? fallbackBase(handoff.target_branch);
+  const baseRef = launch.base ?? fallbackBase(handoff.target_branch);
   const baseSha = await resolveBase(repo, baseRef);
   const entries = await changedFiles(repo, baseRef);
   if (entries.length === 0) {
@@ -93,6 +106,31 @@ async function openDiff(handoff: Handoff, repo: string, base: string | undefined
     handoff,
   );
 
+  await openDiff(handoff, repo, git, baseSha, files, added);
+
+  active?.dispose();
+  void vscode.commands.executeCommand("setContext", "changewalk.reviewing", true);
+  active = new ReviewSession({
+    context: requireContext(),
+    handoff,
+    repo,
+    reading: readingOrder(handoff, files),
+    files,
+    leftUri: (file) => (added.has(file) ? undefined : git.toGitUri(vscode.Uri.file(path.join(repo, file)), baseSha)),
+    openChangesSinceReview: (sha) => openDiffAgainst(handoff, repo, git, sha),
+  });
+  await active.start();
+}
+
+/** Opens the changed files as one multi-file diff against `baseSha`. */
+async function openDiff(
+  handoff: Handoff,
+  repo: string,
+  git: GitApi,
+  baseSha: string,
+  files: string[],
+  added: Set<string>,
+): Promise<void> {
   const resources = files.map((file) => {
     const fileUri = vscode.Uri.file(path.join(repo, file));
     // An added file has no content at the base, so its left side is empty
@@ -102,57 +140,32 @@ async function openDiff(handoff: Handoff, repo: string, base: string | undefined
       : git.toGitUri(fileUri, baseSha);
     return [fileUri, original, fileUri] as [vscode.Uri, vscode.Uri, vscode.Uri];
   });
-
   const title = `Review ${changeNumber(handoff)} · ${handoff.title}`;
   await vscode.commands.executeCommand("vscode.changes", title, resources);
 }
 
-async function showDescription(handoff: Handoff): Promise<void> {
-  const panel = vscode.window.createWebviewPanel(
-    "changewalk.description",
-    `${changeNumber(handoff)} · ${handoff.title}`,
-    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-    { enableScripts: false },
-  );
-  panel.webview.html = descriptionHtml(handoff);
+/** Opens the diff against a commit, with the same files in the same order. */
+async function openDiffAgainst(handoff: Handoff, repo: string, git: GitApi, sha: string): Promise<void> {
+  const entries = await changedFiles(repo, sha);
+  if (entries.length === 0) {
+    void vscode.window.showInformationMessage("Nothing has changed since your review.");
+    return;
+  }
+  const added = new Set(entries.filter((entry) => entry.added).map((entry) => entry.path));
+  await openDiff(handoff, repo, git, sha, entries.map((entry) => entry.path), added);
 }
 
-function descriptionHtml(handoff: Handoff): string {
-  const author = handoff.author?.name ? ` · ${escapeHtml(handoff.author.name)}` : "";
-  const counts =
-    handoff.additions !== undefined || handoff.deletions !== undefined
-      ? `<p class="counts">+${handoff.additions ?? 0} −${handoff.deletions ?? 0}</p>`
-      : "";
-  const summary = handoff.review?.summary
-    ? `<section class="summary"><h2>Summary</h2><p>${escapeHtml(handoff.review.summary)}</p></section>`
-    : "";
-  const description = handoff.description
-    ? `<pre class="body">${escapeHtml(handoff.description)}</pre>`
-    : `<p class="empty">No description.</p>`;
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
-<style>
-  body { font-family: var(--vscode-font-family); padding: 1rem 1.25rem; line-height: 1.5; }
-  h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
-  .meta { color: var(--vscode-descriptionForeground); margin: 0 0 1rem; }
-  .counts { color: var(--vscode-descriptionForeground); margin: 0 0 1rem; }
-  .body { white-space: pre-wrap; word-wrap: break-word; font-family: var(--vscode-font-family); }
-  .empty { color: var(--vscode-descriptionForeground); font-style: italic; }
-  a { color: var(--vscode-textLink-foreground); }
-  .summary { border-left: 2px solid var(--vscode-focusBorder); padding-left: .75rem; margin-bottom: 1rem; }
-</style>
-</head>
-<body>
-  <h1>${escapeHtml(handoff.title)}</h1>
-  <p class="meta">${escapeHtml(changeNumber(handoff))}${author} · <a href="${escapeAttr(handoff.web_url)}">open on host</a></p>
-  ${counts}
-  ${summary}
-  ${description}
-</body>
-</html>`;
+/** The reading order of the files, with each file's reason and notes where the CLI sent them. */
+function readingOrder(handoff: Handoff, files: string[]): OrderedFile[] {
+  const byPath = new Map((handoff.review?.order ?? []).map((entry) => [entry.path, entry]));
+  return files.map((file) => byPath.get(file) ?? { path: file });
+}
+
+function requireContext(): vscode.ExtensionContext {
+  if (!extensionContext) {
+    throw new Error("changewalk is not activated");
+  }
+  return extensionContext;
 }
 
 function firstWorkspaceFolder(): string | undefined {
@@ -162,25 +175,4 @@ function firstWorkspaceFolder(): string | undefined {
 function reportError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   void vscode.window.showErrorMessage(`changewalk: ${message}`);
-}
-
-function escapeHtml(text: string): string {
-  return text.replace(/[&<>"']/g, (c) => {
-    switch (c) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      default:
-        return "&#39;";
-    }
-  });
-}
-
-function escapeAttr(text: string): string {
-  return escapeHtml(text);
 }

@@ -4,7 +4,8 @@
 
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { Handoff } from "./handoff";
+import { DiffRefs, Handoff } from "./handoff";
+import { FileOnGitLab, parseDiffFile, parseHunks } from "./placement";
 
 const run = promisify(execFile);
 
@@ -87,4 +88,33 @@ export async function resolveBase(repo: string, base: string): Promise<string> {
   }
   const { stdout } = await run("git", ["rev-parse", base], { cwd: repo });
   return stdout.trim();
+}
+
+/** Runs git in `repo` and returns its stdout. */
+export async function git(repo: string, args: string[]): Promise<string> {
+  const { stdout } = await run("git", args, { cwd: repo, maxBuffer: 16 * 1024 * 1024 });
+  return stdout;
+}
+
+/** Fetches any of `shas` the clone lacks, so the merge request's diff reads locally. */
+export async function ensureCommits(repo: string, shas: string[]): Promise<void> {
+  for (const sha of shas) {
+    const present = await git(repo, ["cat-file", "-e", `${sha}^{commit}`]).then(
+      () => true,
+      () => false,
+    );
+    if (!present) {
+      await git(repo, ["fetch", "--quiet", "origin", sha]).catch(() => {
+        throw new Error(`the merge request's commit ${sha} is not in this clone`);
+      });
+    }
+  }
+}
+
+/** What GitLab holds for one file of the merge request, and how the file on disk differs from head. */
+export async function loadFileOnGitLab(repo: string, refs: DiffRefs, path: string): Promise<FileOnGitLab> {
+  await ensureCommits(repo, [refs.base_sha, refs.head_sha]);
+  const diff = await git(repo, ["diff", "-U3", refs.base_sha, refs.head_sha, "--", path]);
+  const sinceHead = await git(repo, ["diff", "-U0", refs.head_sha, "--", path]);
+  return { path, diff: parseDiffFile(diff), sinceHead: parseHunks(sinceHead) };
 }

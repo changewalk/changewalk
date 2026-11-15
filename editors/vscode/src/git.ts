@@ -5,7 +5,7 @@
 import * as vscode from "vscode";
 
 /** The minimal slice of VS Code's Git extension API we use. */
-interface GitApi {
+export interface GitApi {
   toGitUri(uri: vscode.Uri, ref: string): vscode.Uri;
 }
 

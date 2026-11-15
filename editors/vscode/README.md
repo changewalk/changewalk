@@ -10,10 +10,28 @@ same `.vsix`. The only differences are the launch scheme (`vscode://` or
 
 ## Status
 
-Phase 1. It opens an ordered multi-file diff of the change, with the
-description beside it. Review threads, the model's reading order and notes,
-and the summary come from the CLI's review payload in a later phase; the
-renderer already orders files by `review.order` when the CLI sends it.
+At parity with the Zed review flow, through `glab`:
+
+- An ordered multi-file diff of the change, files in the model's reading
+  order, with the description, summary, reading order and notes beside it.
+- The model's notes sit on their lines as read-only comment threads.
+- The merge request's own threads are drawn on their lines (replies,
+  resolve/reopen, edit your own note); threads on removed lines go on the
+  diff's left side. Threads on the change itself sit under the description.
+- Comment on any changed line to draft a review comment; **changewalk: Post
+  the review** places each draft on the merge request's head commit, posts an
+  optional summary, and gives a verdict (approve / request changes). A
+  comment GitLab cannot place is reported and the rest still post; a verdict
+  waits while any comment is unplaced.
+- Approvals, your reviewer standing, and related issues are shown.
+- **Mark as reviewed** records the tip, so a later visit can show only what
+  changed since. Pictures in the description that are project uploads are
+  fetched through `glab` and drawn inline.
+
+The reading order and notes arrive in the hand-off's `review` field, which
+the CLI fills from the same order cache the Zed fork uses. Threads,
+approvals and verdicts need a GitLab merge request and the `glab` CLI logged
+in (`glab auth login`); a GitHub change opens as a plain ordered diff.
 
 ## How it is launched
 

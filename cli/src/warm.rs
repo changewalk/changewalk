@@ -85,9 +85,18 @@ pub fn warm_by_iid(project: &Project, merge_request: &MergeRequest) -> Result<bo
     warm_one(project, merge_request, &api_key)
 }
 
-/// True when an order was written; false when one was already there or
-/// the branch is not fetched.
-fn warm_one(project: &Project, merge_request: &MergeRequest, api_key: &str) -> Result<bool> {
+/// Where a change's order lives: the clone it is read in, the base it is
+/// diffed against, the tip it is for, and the cache file.
+struct OrderTarget {
+    repo: PathBuf,
+    base_ref: String,
+    head_sha: String,
+    file: PathBuf,
+}
+
+/// The order target of `merge_request`, or None when its branch is not
+/// fetched.
+fn order_target(project: &Project, merge_request: &MergeRequest) -> Option<OrderTarget> {
     let mut merge_request = merge_request.clone();
     if let Some(worktree) =
         launch::worktree_holding(&merge_request.repo, &merge_request.source_branch)
@@ -96,12 +105,42 @@ fn warm_one(project: &Project, merge_request: &MergeRequest, api_key: &str) -> R
     }
     let repo = merge_request.repo.clone();
     let source = format!("origin/{}", merge_request.source_branch);
-    let Ok(head_sha) = git(&repo, &["rev-parse", &source]) else {
-        return Ok(false);
-    };
+    let head_sha = git(&repo, &["rev-parse", &source]).ok()?;
     let base_ref = launch::review_base(&merge_request)
         .unwrap_or_else(|| format!("origin/{}", project.default_branch));
-    let Some(file) = cache_file(&repo, &base_ref, &head_sha) else {
+    let file = cache_file(&repo, &base_ref, &head_sha)?;
+    Some(OrderTarget {
+        repo,
+        base_ref,
+        head_sha,
+        file,
+    })
+}
+
+/// The reading order and notes for an editor that runs no review of its
+/// own, as the hand-off's `review` field: the cached order, made now when
+/// the model key is set and there is none yet. None when there is no order.
+pub fn review_for_hand_off(merge_request: &MergeRequest) -> Option<serde_json::Value> {
+    let project = Project::discover(&merge_request.repo, merge_request.forge).ok()?;
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        warm_one(&project, merge_request, &api_key).ok();
+    }
+    let target = order_target(&project, merge_request)?;
+    let text = std::fs::read_to_string(&target.file).ok()?;
+    let cached: CachedOrder = serde_json::from_str(&text).ok()?;
+    Some(serde_json::json!({ "order": cached.entries }))
+}
+
+/// True when an order was written; false when one was already there or
+/// the branch is not fetched.
+fn warm_one(project: &Project, merge_request: &MergeRequest, api_key: &str) -> Result<bool> {
+    let Some(OrderTarget {
+        repo,
+        base_ref,
+        head_sha,
+        file,
+    }) = order_target(project, merge_request)
+    else {
         return Ok(false);
     };
     if file.exists() {

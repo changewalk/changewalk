@@ -1,7 +1,9 @@
-// Runs inside a real VS Code. Opens a review from the fixture hand-off and
-// asserts the diff and the description both opened as editor tabs.
+// Runs inside a real VS Code. Opens a review from the hand-off the CLI wrote
+// (synthetic fixture, or a live PR via CW_E2E_*) and asserts the diff and the
+// description both opened, with tabs that match the change the hand-off names.
 
 import * as assert from "assert";
+import * as fs from "fs";
 import * as vscode from "vscode";
 
 describe("changewalk review in the editor", () => {
@@ -10,22 +12,24 @@ describe("changewalk review in the editor", () => {
     assert.ok(extension, "the changewalk extension is not present");
     await extension.activate();
 
-    const handoff = process.env.CW_TEST_HANDOFF;
-    assert.ok(handoff, "CW_TEST_HANDOFF is not set");
+    const handoffPath = process.env.CW_TEST_HANDOFF;
+    assert.ok(handoffPath, "CW_TEST_HANDOFF is not set");
+    const handoff = JSON.parse(fs.readFileSync(handoffPath, "utf8")) as { iid: number; forge: string };
+    const number = `${handoff.forge === "github" ? "#" : "!"}${handoff.iid}`;
 
-    await vscode.commands.executeCommand("changewalk.openReviewFromFile", handoff);
+    await vscode.commands.executeCommand("changewalk.openReviewFromFile", handoffPath);
     // The command awaits the open, but the editor registers tabs on the next
     // tick; give it a moment before reading them.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
 
     const labels = vscode.window.tabGroups.all.flatMap((group) => group.tabs).map((tab) => tab.label);
     assert.ok(
-      labels.some((label) => label.startsWith("!42")),
-      `no description tab for the change; open tabs: ${labels.join(" | ")}`,
+      labels.some((label) => label.startsWith(number)),
+      `no description tab for ${number}; open tabs: ${labels.join(" | ")}`,
     );
     assert.ok(
-      labels.some((label) => label.startsWith("Review !42")),
-      `no diff tab for the change; open tabs: ${labels.join(" | ")}`,
+      labels.some((label) => label.startsWith(`Review ${number}`)),
+      `no diff tab for ${number}; open tabs: ${labels.join(" | ")}`,
     );
   });
 });
