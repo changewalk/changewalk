@@ -162,12 +162,19 @@ jobs:
           echo "Cursor: $deb"
           curl -fsSL "$deb" -o /tmp/cursor.deb
           sudo apt-get install -y /tmp/cursor.deb
-          # The Electron binary, not the /usr/bin/cursor CLI wrapper.
-          bin=$(find /usr/share/cursor /opt/cursor -maxdepth 2 -type f -name cursor 2>/dev/null | head -1)
-          if [ -z "${bin:-}" ] || [ ! -x "$bin" ]; then
-            echo "Cursor binary not found; candidates:"; find / -type f -name cursor 2>/dev/null | head
+          # Ask dpkg where it put the files, rather than guessing a path. The
+          # Electron binary is /usr/share/cursor/cursor; /usr/bin/cursor is
+          # only the CLI wrapper, which @vscode/test-electron cannot launch.
+          bin=$(dpkg -L cursor | grep -E '/usr/share/cursor/cursor$' | head -1 || true)
+          if [ -z "$bin" ]; then
+            bin=$(dpkg -L cursor | grep -E '/cursor$' | grep -v '^/usr/bin/' | head -1 || true)
+          fi
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "Cursor binary not found; installed files named cursor:"
+            dpkg -L cursor | grep -i cursor || true
             exit 1
           fi
+          echo "Cursor binary: $bin"
           echo "CW_VSCODE_EXEC=$bin" >> "$GITHUB_ENV"
 
       - name: Integration test (real Cursor)
