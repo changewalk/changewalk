@@ -87,9 +87,9 @@ counts from the host, then line counts from the clone after a `git fetch`.
 Changes the host has not updated since the last refresh are not asked about
 again, and a fetch from the last two minutes is reused. Last, with
 `ANTHROPIC_API_KEY` set and Zed as the editor, the reading order of the top
-three changes you review is written to Zed's cache, so opening one shows its
-order at once; `CHANGEWALK_ORDER_MODEL` and `CHANGEWALK_NOTES_MODEL` choose the
-models.
+five changes you review is written to Zed's cache, so opening one shows its
+order at once; `CHANGEWALK_WARM_COUNT` overrides how many, and
+`CHANGEWALK_ORDER_MODEL` and `CHANGEWALK_NOTES_MODEL` choose the models.
 
 The last list shows at once from a cache and only changes when you press `r`,
 except on a first run with nothing cached, when it fetches straight away.
@@ -174,6 +174,7 @@ bundle onboarding found. `--app` (or `ZED_APP`) overrides the bundle, and
 | --- | --- |
 | `CHANGEWALK_REPOS` | Colon-separated repositories to list from any directory |
 | `ANTHROPIC_API_KEY` | Enables reading-order and notes in Zed; passed to Zed on launch |
+| `CHANGEWALK_WARM_COUNT` | How many top reviews to warm Zed's order cache for (default 5) |
 | `CHANGEWALK_ORDER_MODEL` | Model for the reading order |
 | `CHANGEWALK_NOTES_MODEL` | Model for the guiding notes |
 | `ZED_APP` | Path to the editor app bundle, same as `--app` (overrides onboarding) |

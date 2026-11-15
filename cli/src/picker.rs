@@ -381,7 +381,13 @@ impl Picker {
                 // show it at once when one is opened. Only Zed reads this
                 // cache; the thin clients get their order from the CLI.
                 if warm {
-                    crate::warm::warm_order_cache(&project, &list, 3);
+                    // The top few by default, or as many as
+                    // CHANGEWALK_WARM_COUNT asks for.
+                    let count = std::env::var("CHANGEWALK_WARM_COUNT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(5);
+                    crate::warm::warm_order_cache(&project, &list, count);
                 }
             });
         }
