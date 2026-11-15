@@ -69,7 +69,9 @@ async function main(): Promise<void> {
       extensionTestsPath,
       // Open the clone as the workspace; disable other installed extensions
       // so the test runs against this source, not the installed build.
-      launchArgs: [repo, "--disable-extensions"],
+      // --no-sandbox is needed on Linux CI, where an AppImage-extracted
+      // editor has no SUID sandbox helper (set CW_NO_SANDBOX there).
+      launchArgs: [repo, "--disable-extensions", ...(process.env.CW_NO_SANDBOX ? ["--no-sandbox"] : [])],
       extensionTestsEnv: { CW_TEST_HANDOFF: handoff },
     });
   } catch (error) {

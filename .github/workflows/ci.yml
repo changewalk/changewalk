@@ -15,8 +15,10 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  test:
-    name: Format, lint, test
+  # Stage 1: the CLI. The editors are thin clients the CLI feeds, so nothing
+  # downstream is worth running until the CLI itself is sound.
+  cli:
+    name: CLI — format, lint, test
     runs-on: ubuntu-latest
     steps:
       - name: Check out the code
@@ -41,3 +43,132 @@ jobs:
 
       - name: Build the release binary
         run: cargo build --release
+
+  # Stage 2, job 1: the Zed review flow. It is not a buildable extension but a
+  # patch series compiled into Zed, so the cheap, meaningful check is that the
+  # series still applies onto the CURRENT upstream Zed release, resolved fresh
+  # at run time (a deliberately moving target). This builds nothing, so it
+  # finishes in seconds, fetching only the touched crates.
+  #
+  # Because the target moves, a green commit can later go red when Zed
+  # publishes a release that conflicts with the patches, with no change here.
+  # That is intended: red means "refresh the series (script/sync-zed.sh)".
+  zed:
+    name: Zed — patches apply onto latest release
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Assert the patch series applies onto the latest Zed release
+        run: script/check-zed-patches.sh --latest-release
+
+  # Stage 2, job 2: the VS Code extension — typecheck, unit tests, bundle, and
+  # the in-editor integration test inside a real, downloaded VS Code.
+  vscode:
+    name: VS Code — typecheck, unit, integration
+    needs: cli
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    env:
+      # An AppImage/headless editor on CI has no SUID sandbox helper.
+      CW_NO_SANDBOX: "1"
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Bundle the extension
+        run: npm run build
+
+      - name: Install the libraries a headless editor needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libgbm1 libasound2t64 \
+            libgtk-3-0 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxdamage1
+
+      - name: Integration test (real VS Code)
+        run: xvfb-run -a npm run test:integration
+
+  # Stage 2, job 3: the same extension in Cursor. Cursor is a VS Code fork that
+  # runs the identical build, so this runs the same suites against Cursor's own
+  # binary (via the CW_VSCODE_EXEC hook in runTest.ts). Cursor is fetched from
+  # its public download endpoint — an external, undocumented URL, so if its
+  # shape changes this step is where to update (pin CURSOR_DOWNLOAD).
+  cursor:
+    name: Cursor — typecheck, unit, integration
+    needs: cli
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    env:
+      CW_NO_SANDBOX: "1"
+      CURSOR_DOWNLOAD: "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Bundle the extension
+        run: npm run build
+
+      - name: Install xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Download and install Cursor
+        run: |
+          set -euo pipefail
+          # The endpoint returns { downloadUrl (AppImage), debUrl, rpmUrl, version }.
+          # The .deb is used so apt resolves the editor's own GTK/NSS deps and
+          # installs the binary at a predictable path.
+          deb=$(curl -fsSL "$CURSOR_DOWNLOAD" \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const u=j.debUrl;if(!u){console.error('no debUrl in',s);process.exit(1)}process.stdout.write(u)})")
+          echo "Cursor: $deb"
+          curl -fsSL "$deb" -o /tmp/cursor.deb
+          sudo apt-get install -y /tmp/cursor.deb
+          # The Electron binary, not the /usr/bin/cursor CLI wrapper.
+          bin=$(find /usr/share/cursor /opt/cursor -maxdepth 2 -type f -name cursor 2>/dev/null | head -1)
+          if [ -z "${bin:-}" ] || [ ! -x "$bin" ]; then
+            echo "Cursor binary not found; candidates:"; find / -type f -name cursor 2>/dev/null | head
+            exit 1
+          fi
+          echo "CW_VSCODE_EXEC=$bin" >> "$GITHUB_ENV"
+
+      - name: Integration test (real Cursor)
+        run: xvfb-run -a npm run test:integration
