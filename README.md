@@ -62,7 +62,15 @@ changes assigned to you instead of ones you review.
 | `g` | Open the change on its host |
 | `r` | Refresh the list |
 | `u` `d` | Scroll the description |
+| `h` `?` | Open the help menu, which also switches host and editor |
 | `q` | Quit |
+
+The help menu (`h` or `?`) is the settings switcher too: `↑` `↓` moves
+between the **Host** (GitLab, GitHub) and **Editor** (Zed, VS Code, Cursor)
+rows, and `←` `→` changes the chosen one, each in its own colour. The editor
+takes effect on the next `Enter`; the host re-reads each clone's remote and
+refreshes, which only changes a self-hosted remote that names neither host.
+Both choices are saved, the same as `--onboard`.
 
 A refresh also runs `git fetch --prune origin` in each clone, so the branches
 your editor diffs against are current. On Enter a local branch left from an

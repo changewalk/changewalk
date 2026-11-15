@@ -143,16 +143,7 @@ fn main() -> Result<()> {
         println!("{}", launch::open(config.ide, &merge_request, &app)?);
         return Ok(());
     }
-    let ide = config.ide;
-    picker::run(
-        cached,
-        projects,
-        role,
-        default_branches,
-        title,
-        ide,
-        move |merge_request| launch::open(ide, merge_request, &app),
-    )
+    picker::run(cached, projects, role, default_branches, title, config, app)
 }
 
 /// Forgets the saved configuration and clears the cache, as asked. Each is

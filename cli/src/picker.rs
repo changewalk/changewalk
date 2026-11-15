@@ -15,10 +15,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Command,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, TryRecvError},
-    },
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -37,9 +34,6 @@ enum FetchStage {
 }
 
 type FetchResult = (Project, Result<FetchStage>);
-
-/// Opens a merge request in Zed and says what happened, or why not.
-type Launcher = dyn Fn(&MergeRequest) -> Result<String> + Send + Sync;
 
 const NUMBER: Color = Color::Cyan;
 const AUTHOR: Color = Color::Magenta;
@@ -73,11 +67,17 @@ struct Picker {
     last_opened: Option<LastOpened>,
     projects: Vec<Project>,
     role: Role,
-    /// The editor reviews open in, for the status line and the key hint.
-    editor_name: &'static str,
-    /// Whether to warm Zed's order cache on a refresh. Only Zed reads it;
-    /// the thin clients get their order from the CLI instead.
-    warm: bool,
+    /// The editor a review opens in, switchable from the help menu. Its name
+    /// heads the hints and its scheme is handed the review on Enter.
+    ide: Ide,
+    /// The editor's app bundle, kept in step with `ide` when it is switched.
+    app: PathBuf,
+    /// The host to assume for a clone whose remote names neither, switchable
+    /// from the help menu. Only a self-hosted remote is re-read when it
+    /// changes; `gitlab.com` and `github.com` name themselves.
+    forge_default: Forge,
+    /// Which setting the help menu's switcher has focused: 0 host, 1 editor.
+    help_row: usize,
     /// Fresh lists arrive here while a refresh is running.
     fetches: Option<Receiver<FetchResult>>,
     /// The launch in progress, which runs on its own thread because the
@@ -89,18 +89,20 @@ struct Picker {
     started: Instant,
 }
 
-/// Shows the list until the user quits. Enter hands the selected merge
-/// request to `launcher` and keeps the list open; `r` fetches fresh lists
+/// Shows the list until the user quits. Enter opens the selected merge
+/// request in the editor and keeps the list open; `r` fetches fresh lists
 /// for `projects`. With nothing cached the first fetch runs at once, since
-/// an empty list would say nothing.
+/// an empty list would say nothing. `config` holds the host and editor the
+/// help menu can switch; `app` is the editor's bundle, with any `--app`
+/// override already folded in.
 pub fn run(
     cached: Vec<MergeRequest>,
     projects: Vec<Project>,
     role: Role,
     default_branches: HashMap<PathBuf, String>,
     title: String,
-    ide: Ide,
-    launcher: impl Fn(&MergeRequest) -> Result<String> + Send + Sync + 'static,
+    config: crate::config::Config,
+    app: PathBuf,
 ) -> Result<()> {
     let nothing_cached = cached.is_empty();
     let mut picker = Picker {
@@ -115,8 +117,10 @@ pub fn run(
         last_opened: forge::last_opened(),
         projects,
         role,
-        editor_name: ide.name(),
-        warm: ide.runs_review_in_editor(),
+        ide: config.ide,
+        app,
+        forge_default: config.forge,
+        help_row: 0,
         fetches: None,
         launching: None,
         show_help: false,
@@ -125,19 +129,14 @@ pub fn run(
     if nothing_cached {
         picker.refresh();
     }
-    let launcher: Arc<Launcher> = Arc::new(launcher);
     let mut terminal = ratatui::init();
-    let outcome = picker.event_loop(&mut terminal, &launcher);
+    let outcome = picker.event_loop(&mut terminal);
     ratatui::restore();
     outcome
 }
 
 impl Picker {
-    fn event_loop(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        launcher: &Arc<Launcher>,
-    ) -> Result<()> {
+    fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         loop {
             self.receive();
             self.receive_launch();
@@ -149,6 +148,28 @@ impl Picker {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // The help menu is also the settings switcher, so while it is open
+            // the arrows move and change the settings rather than the list.
+            if self.show_help {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_row = self.help_row.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_row = (self.help_row + 1).min(1)
+                    }
+                    KeyCode::Left => self.cycle_setting(false),
+                    KeyCode::Right => self.cycle_setting(true),
+                    KeyCode::Char('h' | '?' | 'q') | KeyCode::Esc | KeyCode::Enter => {
+                        self.show_help = false
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 continue;
             }
             match key.code {
@@ -165,7 +186,7 @@ impl Picker {
                         .saturating_add(10)
                         .min(self.description_max_scroll.get())
                 }
-                KeyCode::Enter => self.launch(launcher),
+                KeyCode::Enter => self.launch(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Char('g') | KeyCode::Char('o') => {
                     if let Some(merge_request) = self.items.get(self.selected) {
@@ -175,8 +196,7 @@ impl Picker {
                             .ok();
                     }
                 }
-                KeyCode::Char('h') | KeyCode::Char('?') => self.show_help = !self.show_help,
-                KeyCode::Esc if self.show_help => self.show_help = false,
+                KeyCode::Char('h') | KeyCode::Char('?') => self.show_help = true,
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(());
@@ -186,9 +206,9 @@ impl Picker {
         }
     }
 
-    /// Opens the selected merge request in Zed on a thread, so the list
-    /// stays live, and remembers it as the last one opened.
-    fn launch(&mut self, launcher: &Arc<Launcher>) {
+    /// Opens the selected merge request in the editor on a thread, so the
+    /// list stays live, and remembers it as the last one opened.
+    fn launch(&mut self) {
         if self.launching.is_some() {
             self.status = "still opening the last one; a fetch may be waiting on git".into();
             return;
@@ -196,18 +216,97 @@ impl Picker {
         let Some(merge_request) = self.items.get(self.selected).cloned() else {
             return;
         };
-        self.status = format!(
-            "opening {} in {}…",
-            merge_request.number(),
-            self.editor_name
-        );
+        self.status = format!("opening {} in {}…", merge_request.number(), self.ide.name());
         self.last_opened = Some(forge::remember_opened(&merge_request));
         let (sender, receiver) = mpsc::channel();
-        let launcher = launcher.clone();
+        let ide = self.ide;
+        let app = self.app.clone();
         thread::spawn(move || {
-            sender.send(launcher(&merge_request)).ok();
+            sender
+                .send(crate::launch::open(ide, &merge_request, &app))
+                .ok();
         });
         self.launching = Some(receiver);
+    }
+
+    /// Whether to warm Zed's order cache on a refresh. Only Zed reads it;
+    /// the thin clients get their order from the CLI instead.
+    fn warm(&self) -> bool {
+        self.ide.runs_review_in_editor()
+    }
+
+    /// Steps the focused setting to its next or previous value and applies
+    /// it at once: the editor for the next launch, the host with a re-list.
+    fn cycle_setting(&mut self, forward: bool) {
+        let step = |index: usize, count: usize| {
+            if forward {
+                (index + 1) % count
+            } else {
+                (index + count - 1) % count
+            }
+        };
+        if self.help_row == 0 {
+            let at = Forge::ALL
+                .iter()
+                .position(|&forge| forge == self.forge_default)
+                .unwrap_or(0);
+            self.set_forge(Forge::ALL[step(at, Forge::ALL.len())]);
+        } else {
+            let at = Ide::ALL
+                .iter()
+                .position(|&ide| ide == self.ide)
+                .unwrap_or(0);
+            self.set_ide(Ide::ALL[step(at, Ide::ALL.len())]);
+        }
+    }
+
+    /// Switches the editor the next launch opens in and remembers it. The
+    /// app bundle follows, since the saved one was the old editor's.
+    fn set_ide(&mut self, ide: Ide) {
+        if ide == self.ide {
+            return;
+        }
+        self.ide = ide;
+        self.app = ide.default_app();
+        self.persist(|config| {
+            config.ide = ide;
+            config.app = Some(ide.default_app());
+        });
+        self.status = format!("editor set to {}", ide.name());
+    }
+
+    /// Switches the assumed host and re-reads each clone's remote under it,
+    /// then refreshes. A remote that names its own host is unchanged; only a
+    /// self-hosted one follows the new assumption.
+    fn set_forge(&mut self, forge: Forge) {
+        if forge == self.forge_default {
+            return;
+        }
+        self.forge_default = forge;
+        self.projects = self
+            .projects
+            .iter()
+            .map(|project| {
+                Project::discover(&project.repo, forge).unwrap_or_else(|_| project.clone())
+            })
+            .collect();
+        self.default_branches = self
+            .projects
+            .iter()
+            .map(|project| (project.repo.clone(), project.default_branch.clone()))
+            .collect();
+        self.persist(|config| config.forge = forge);
+        self.status = format!("host set to {}; refreshing…", forge.name());
+        self.refresh();
+    }
+
+    /// Loads the saved configuration, applies `change`, and writes it back,
+    /// so a switch made here outlives the session. A failure to save is left
+    /// quiet: the change still holds for this run.
+    fn persist(&self, change: impl FnOnce(&mut crate::config::Config)) {
+        let mut config = crate::config::Config::load().unwrap_or_default();
+        change(&mut config);
+        config.save().ok();
     }
 
     /// Asks GitLab for every project's list on its own thread, unless a
@@ -219,7 +318,7 @@ impl Picker {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        let warm = self.warm;
+        let warm = self.warm();
         for project in self.projects.clone() {
             let sender = sender.clone();
             let role = self.role;
@@ -407,30 +506,57 @@ impl Picker {
         }
     }
 
-    /// The keys, in a box over the description, since the footer has room
-    /// only for `h help` once the window narrows.
+    /// The settings switcher and the keys, in a box over the description.
+    /// The switcher heads it, since changing the host or editor is the one
+    /// thing the menu does beyond listing the keys.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         let forge = self.forge().map_or("the web", Forge::name);
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                " Settings",
+                Style::default().fg(HEADING).bold(),
+            )),
+            setting_row(
+                "Host",
+                self.help_row == 0,
+                Forge::ALL
+                    .iter()
+                    .map(|&f| (f.name(), forge_colour(f), f == self.forge_default))
+                    .collect(),
+            ),
+            setting_row(
+                "Editor",
+                self.help_row == 1,
+                Ide::ALL
+                    .iter()
+                    .map(|&i| (i.name(), ide_colour(i), i == self.ide))
+                    .collect(),
+            ),
+            Line::from(Span::styled(
+                "   ↑↓ choose  ←→ change",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(" Keys", Style::default().fg(HEADING).bold())),
+        ];
         let keys = [
             ("↑↓  j k", "move".to_string()),
-            ("⏎", format!("open in {}", self.editor_name)),
+            ("⏎", format!("open in {}", self.ide.name())),
             ("g  o", format!("open on {forge}")),
             ("r", "refresh".to_string()),
             ("u  d", "scroll the description".to_string()),
             ("Home  End  G", "first, last".to_string()),
-            ("h  ?", "close this help".to_string()),
-            ("q  esc", "quit".to_string()),
+            ("h  ?  esc", "close this help".to_string()),
+            ("q", "quit".to_string()),
         ];
-        let lines: Vec<Line<'static>> = keys
-            .iter()
-            .map(|(key, action)| {
-                Line::from(vec![
-                    Span::styled(format!(" {key:<13}"), Style::default().fg(NUMBER)),
-                    Span::raw(action.clone()),
-                ])
-            })
-            .collect();
-        let width = 44.min(area.width.saturating_sub(2));
+        lines.extend(keys.iter().map(|(key, action)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<13}"), Style::default().fg(NUMBER)),
+                Span::raw(action.clone()),
+            ])
+        }));
+
+        let width = 48.min(area.width.saturating_sub(2));
         let height = u16::try_from(lines.len() + 2)
             .unwrap_or(u16::MAX)
             .min(area.height);
@@ -443,7 +569,7 @@ impl Picker {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Keys ");
+            .title(" Settings & keys ");
         frame.render_widget(Clear, popup);
         frame.render_widget(Paragraph::new(lines).block(block), popup);
     }
@@ -700,6 +826,48 @@ fn key_hint(key: &str, action: &str) -> Span<'static> {
     Span::styled(format!(" {key} {action} "), Style::default().fg(DIM))
 }
 
+/// One switcher row in the help menu: a label, then each option, the chosen
+/// one marked and in its brand colour and the rest dimmed. `▶` points at the
+/// row the arrows are changing.
+fn setting_row(label: &str, focused: bool, options: Vec<(&str, Color, bool)>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            if focused { " ▶ " } else { "   " },
+            Style::default().fg(NUMBER),
+        ),
+        Span::styled(format!("{label:<7}"), Style::default().fg(DIM)),
+    ];
+    for (name, colour, chosen) in options {
+        if chosen {
+            spans.push(Span::styled(
+                format!("● {name}"),
+                Style::default().fg(colour).bold(),
+            ));
+        } else {
+            spans.push(Span::styled(format!("  {name}"), Style::default().fg(DIM)));
+        }
+        spans.push(Span::raw("  "));
+    }
+    Line::from(spans)
+}
+
+/// Each host's own colour: GitLab's orange, GitHub's near-white.
+fn forge_colour(forge: Forge) -> Color {
+    match forge {
+        Forge::Gitlab => Color::Rgb(252, 109, 38),
+        Forge::Github => Color::Rgb(219, 222, 229),
+    }
+}
+
+/// Each editor's own colour, kept apart so two blues do not read alike.
+fn ide_colour(ide: Ide) -> Color {
+    match ide {
+        Ide::Zed => Color::Rgb(8, 116, 209),
+        Ide::VsCode => Color::Rgb(0, 160, 235),
+        Ide::Cursor => Color::Rgb(160, 160, 160),
+    }
+}
+
 /// An RFC 3339 timestamp as `19 Oct 11:32` in local time, or the date alone
 /// when the time cannot be read.
 fn local_time(timestamp: &str) -> String {
@@ -949,8 +1117,10 @@ mod tests {
             default_branches: HashMap::new(),
             projects: Vec::new(),
             role: Role::Reviewer,
-            editor_name: "Zed",
-            warm: true,
+            ide: Ide::Zed,
+            app: PathBuf::from("/Applications/Zed.app"),
+            forge_default: Forge::Gitlab,
+            help_row: 0,
             fetches: None,
             last_opened: Some(LastOpened {
                 web_url: "https://gitlab.com/x/-/merge_requests/1628".into(),
@@ -1034,17 +1204,20 @@ mod tests {
             default_branches: HashMap::new(),
             projects: Vec::new(),
             role: Role::Reviewer,
-            editor_name: "Zed",
-            warm: true,
+            ide: Ide::Zed,
+            app: PathBuf::from("/Applications/Zed.app"),
+            forge_default: Forge::Github,
+            help_row: 0,
             fetches: None,
             last_opened: None,
             launching: None,
             show_help: true,
             started: Instant::now(),
         };
-        let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
+        // Tall enough that the open settings-and-keys panel is not truncated.
+        let mut terminal = Terminal::new(TestBackend::new(130, 28)).unwrap();
         terminal.draw(|frame| picker.draw(frame)).unwrap();
-        let text: String = (0..20)
+        let text: String = (0..28)
             .map(|y| {
                 (0..130)
                     .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
@@ -1054,10 +1227,15 @@ mod tests {
             .join("\n");
         assert!(text.contains("Pull requests to review"), "{text}");
         assert!(text.contains("▶ #1628"), "{text}");
-        assert!(text.contains(" h help "), "{text}");
         assert!(text.contains("open on GitHub"), "{text}");
         assert!(text.contains("scroll the description"), "{text}");
         assert!(!text.contains("!1628"), "{text}");
+        // The help menu is now also the host and editor switcher.
+        assert!(text.contains("Settings"), "{text}");
+        assert!(text.contains("Host"), "{text}");
+        assert!(text.contains("Editor"), "{text}");
+        assert!(text.contains("GitLab") && text.contains("GitHub"), "{text}");
+        assert!(text.contains("Cursor"), "{text}");
     }
 
     #[test]
