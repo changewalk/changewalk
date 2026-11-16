@@ -85,11 +85,6 @@ struct Picker {
     launching: Option<Receiver<Result<String>>>,
     /// Whether the key help is open over the description.
     show_help: bool,
-    /// The brand logos for the help menu's switcher, drawn through the
-    /// terminal's image protocol. None when the terminal cannot show them,
-    /// so the switcher shows coloured dots instead. In a `RefCell` because
-    /// drawing an image state mutates it, while `draw` only has `&self`.
-    icons: Option<std::cell::RefCell<crate::icons::Icons>>,
     /// When the picker started, which paces the refresh spinner.
     started: Instant,
 }
@@ -129,16 +124,12 @@ pub fn run(
         fetches: None,
         launching: None,
         show_help: false,
-        icons: None,
         started: Instant::now(),
     };
     if nothing_cached {
         picker.refresh();
     }
     let mut terminal = ratatui::init();
-    // After the alternate screen is up and before any event is read: ask the
-    // terminal for its image protocol so the switcher can show real logos.
-    picker.icons = crate::icons::Icons::load().map(std::cell::RefCell::new);
     let outcome = picker.event_loop(&mut terminal);
     ratatui::restore();
     outcome
@@ -526,26 +517,27 @@ impl Picker {
     /// thing the menu does beyond listing the keys.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         let forge = self.forge().map_or("the web", Forge::name);
-        let icons_on = self.icons.is_some();
-        let host_options: Vec<(&str, Color, bool)> = Forge::ALL
-            .iter()
-            .map(|&f| (f.name(), forge_colour(f), f == self.forge_default))
-            .collect();
-        let ide_options: Vec<(&str, Color, bool)> = Ide::ALL
-            .iter()
-            .map(|&i| (i.name(), ide_colour(i), i == self.ide))
-            .collect();
-        let (host_line, host_slots) =
-            switcher_line("Host", self.help_row == 0, &host_options, icons_on);
-        let (ide_line, ide_slots) =
-            switcher_line("Editor", self.help_row == 1, &ide_options, icons_on);
-
-        // The switcher heads the box; its two rows are lines 1 and 2, which
-        // the icon pass below depends on.
         let mut lines: Vec<Line<'static>> = vec![
-            Line::from(Span::styled(" Settings", Style::default().fg(HEADING).bold())),
-            host_line,
-            ide_line,
+            Line::from(Span::styled(
+                " Settings",
+                Style::default().fg(HEADING).bold(),
+            )),
+            setting_row(
+                "Host",
+                self.help_row == 0,
+                Forge::ALL
+                    .iter()
+                    .map(|&f| (f.name(), forge_colour(f), f == self.forge_default))
+                    .collect(),
+            ),
+            setting_row(
+                "Editor",
+                self.help_row == 1,
+                Ide::ALL
+                    .iter()
+                    .map(|&i| (i.name(), ide_colour(i), i == self.ide))
+                    .collect(),
+            ),
             Line::from(Span::styled(
                 "   ↑↓ choose  ←→ change",
                 Style::default().fg(DIM),
@@ -586,25 +578,6 @@ impl Picker {
             .title(" Settings & keys ");
         frame.render_widget(Clear, popup);
         frame.render_widget(Paragraph::new(lines).block(block), popup);
-
-        // Draw a real logo over each two-cell slot the switcher left blank.
-        if let Some(cell) = &self.icons {
-            let mut icons = cell.borrow_mut();
-            // Line 1 is Host, line 2 is Editor; the text starts one cell in
-            // from the popup's top-left corner, inside the border.
-            let host_y = popup.y + 1 + 1;
-            let ide_y = popup.y + 1 + 2;
-            for (&col, &forge) in host_slots.iter().zip(Forge::ALL.iter()) {
-                if let Some(slot) = icon_slot(popup, popup.x + 1 + col, host_y) {
-                    icons.draw_forge(frame, slot, forge);
-                }
-            }
-            for (&col, &ide) in ide_slots.iter().zip(Ide::ALL.iter()) {
-                if let Some(slot) = icon_slot(popup, popup.x + 1 + col, ide_y) {
-                    icons.draw_ide(frame, slot, ide);
-                }
-            }
-        }
     }
 
     /// The spinner frame for this draw, while a refresh runs.
@@ -859,18 +832,10 @@ fn key_hint(key: &str, action: &str) -> Span<'static> {
     Span::styled(format!(" {key} {action} "), Style::default().fg(DIM))
 }
 
-/// One switcher row in the help menu: a label, then each option in its brand
-/// colour, the chosen one in bold. `▶` points at the row the arrows change.
-///
-/// Each option keeps a two-cell slot ahead of its name: a logo is drawn over
-/// it when `icons` is on, otherwise a `●` marks the chosen one. The returned
-/// columns are where each slot starts, so the caller can place the logos.
-fn switcher_line(
-    label: &str,
-    focused: bool,
-    options: &[(&str, Color, bool)],
-    icons: bool,
-) -> (Line<'static>, Vec<u16>) {
+/// One switcher row in the help menu: a label, then each option, the chosen
+/// one marked and in its brand colour and the rest dimmed. `▶` points at the
+/// row the arrows are changing.
+fn setting_row(label: &str, focused: bool, options: Vec<(&str, Color, bool)>) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             if focused { " ▶ " } else { "   " },
@@ -878,43 +843,18 @@ fn switcher_line(
         ),
         Span::styled(format!("{label:<7}"), Style::default().fg(DIM)),
     ];
-    // The gutter so far: the three-cell marker and a seven-cell label.
-    let mut col: u16 = 10;
-    let mut slots = Vec::with_capacity(options.len());
     for (name, colour, chosen) in options {
-        slots.push(col);
-        if icons {
-            spans.push(Span::raw("  "));
-        } else if *chosen {
-            spans.push(Span::styled("● ", Style::default().fg(*colour)));
+        if chosen {
+            spans.push(Span::styled(
+                format!("● {name}"),
+                Style::default().fg(colour).bold(),
+            ));
         } else {
-            spans.push(Span::raw("  "));
+            spans.push(Span::styled(format!("  {name}"), Style::default().fg(DIM)));
         }
-        spans.push(Span::raw(" "));
-        let style = if *chosen {
-            Style::default().fg(*colour).bold()
-        } else {
-            Style::default().fg(DIM)
-        };
-        spans.push(Span::styled((*name).to_string(), style));
-        spans.push(Span::raw("   "));
-        // Slot (2) + gap (1) + name + trailing gap (3).
-        col += 2 + 1 + u16::try_from(name.chars().count()).unwrap_or(0) + 3;
+        spans.push(Span::raw("  "));
     }
-    (Line::from(spans), slots)
-}
-
-/// A two-cell-wide, one-cell-tall logo area at `x`, `y`, or None when it
-/// would fall outside the popup's border.
-fn icon_slot(popup: Rect, x: u16, y: u16) -> Option<Rect> {
-    let right = popup.x + popup.width.saturating_sub(1);
-    let bottom = popup.y + popup.height.saturating_sub(1);
-    (x + 2 <= right && y < bottom).then_some(Rect {
-        x,
-        y,
-        width: 2,
-        height: 1,
-    })
+    Line::from(spans)
 }
 
 /// Each host's own colour: GitLab's orange, GitHub's near-white.
@@ -1194,7 +1134,6 @@ mod tests {
             }),
             launching: None,
             show_help: false,
-            icons: None,
             started: Instant::now(),
         };
         let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
@@ -1279,7 +1218,6 @@ mod tests {
             last_opened: None,
             launching: None,
             show_help: true,
-            icons: None,
             started: Instant::now(),
         };
         // Tall enough that the open settings-and-keys panel is not truncated.

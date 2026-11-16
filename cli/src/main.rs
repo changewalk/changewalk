@@ -6,7 +6,6 @@ mod config;
 mod forge;
 mod github;
 mod gitlab;
-mod icons;
 mod launch;
 mod onboarding;
 mod picker;
