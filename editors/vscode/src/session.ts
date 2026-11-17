@@ -9,6 +9,7 @@ import { randomBytes } from "crypto";
 import { Handoff, OrderedFile } from "./handoff";
 import * as gl from "./gitlab";
 import { Draft, RemoteNote, RemoteThread, errorText } from "./gitlab";
+import { ReviewBackend, makeBackend } from "./backend";
 import { DescriptionModel, descriptionHtml } from "./description";
 import { loadFileOnGitLab } from "./review";
 
@@ -40,6 +41,7 @@ type Verdict = "comment" | "approve" | "requestChanges";
 
 export class ReviewSession implements vscode.Disposable {
   private readonly controller: vscode.CommentController;
+  private readonly backend: ReviewBackend;
   private readonly fileSet: Set<string>;
   private readonly storage: vscode.Uri;
   private readonly discussionOf = new WeakMap<vscode.CommentThread, string>();
@@ -63,6 +65,7 @@ export class ReviewSession implements vscode.Disposable {
   };
 
   constructor(private readonly options: SessionOptions) {
+    this.backend = makeBackend(options.repo, options.handoff);
     this.fileSet = new Set(options.files);
     this.storage = vscode.Uri.joinPath(options.context.globalStorageUri, "pictures");
     this.controller = vscode.comments.createCommentController("changewalk", "changewalk review");
@@ -93,18 +96,11 @@ export class ReviewSession implements vscode.Disposable {
   /** Re-reads threads, approvals, standing and related issues from GitLab, then redraws. */
   async reload(): Promise<void> {
     this.model.errors = [];
-    if (this.options.handoff.forge !== "gitlab") {
-      this.model.errors.push("Threads and verdicts need a GitLab merge request; this change is on GitHub.");
-      this.renderDescription();
-      return;
-    }
-    const { repo } = this.options;
-    const iid = this.options.handoff.iid;
     const [threads, approvals, reviewer, related] = await Promise.all([
-      this.settle("threads", gl.fetchThreads(repo, iid)),
-      this.settle("approvals", gl.fetchApprovals(repo, iid)),
-      this.settle("your standing", gl.fetchReviewerState(repo, iid)),
-      this.settle("related issues", gl.fetchRelatedIssues(repo, iid)),
+      this.settle("threads", this.backend.fetchThreads()),
+      this.settle("approvals", this.backend.fetchApprovals()),
+      this.settle("your standing", this.backend.fetchReviewerState()),
+      this.settle("related issues", this.backend.fetchRelatedIssues()),
     ]);
     if (threads) {
       this.showLineThreads(threads.onLines);
@@ -131,7 +127,7 @@ export class ReviewSession implements vscode.Disposable {
     const thread = reply.thread;
     const discussionId = this.discussionOf.get(thread);
     if (discussionId) {
-      await gl.replyToThread(this.options.repo, this.options.handoff.iid, discussionId, text);
+      await this.backend.replyToThread(discussionId, text);
       await this.reload();
       return;
     }
@@ -173,7 +169,7 @@ export class ReviewSession implements vscode.Disposable {
       return;
     }
     const resolved = thread.state === vscode.CommentThreadState.Resolved;
-    await gl.setThreadResolved(this.options.repo, this.options.handoff.iid, discussionId, !resolved);
+    await this.backend.setThreadResolved(discussionId, !resolved);
     await this.reload();
   }
 
@@ -188,7 +184,7 @@ export class ReviewSession implements vscode.Disposable {
     if (body === undefined || body.trim() === "" || body.trim() === current.trim()) {
       return;
     }
-    await gl.updateNote(this.options.repo, this.options.handoff.iid, match[1], Number(match[2]), body.trim());
+    await this.backend.updateNote(match[1], Number(match[2]), body.trim());
     await this.reload();
   }
 
@@ -216,7 +212,7 @@ export class ReviewSession implements vscode.Disposable {
     }
 
     const entries = [...this.drafts.entries()];
-    const result = await gl.postDrafts(repo, handoff.iid, refs, entries.map(([, draft]) => draft), (file) =>
+    const result = await this.backend.postDrafts(refs, entries.map(([, draft]) => draft), (file) =>
       loadFileOnGitLab(repo, refs, file),
     );
     for (const [thread, draft] of entries) {
@@ -230,10 +226,10 @@ export class ReviewSession implements vscode.Disposable {
     const blocked = result.failed.length > 0 && pick.verdict !== "comment";
     if (!blocked) {
       if (summary.trim()) {
-        await gl.postNote(repo, handoff.iid, summary.trim());
+        await this.backend.postNote(summary.trim());
       }
       if (pick.verdict !== "comment") {
-        await this.applyVerdict(pick.verdict);
+        await this.applyVerdict(pick.verdict, summary.trim() || undefined);
       }
     }
     await this.reload();
@@ -276,17 +272,12 @@ export class ReviewSession implements vscode.Disposable {
 
   // ---- internals -----------------------------------------------------------
 
-  private async applyVerdict(verdict: "approve" | "requestChanges"): Promise<void> {
-    const { repo, handoff } = this.options;
+  private async applyVerdict(verdict: "approve" | "requestChanges", summary?: string): Promise<void> {
     if (verdict === "approve") {
-      await gl.setApproval(repo, handoff.iid, !this.model.userHasApproved);
+      await this.backend.setApproval(!this.model.userHasApproved);
       return;
     }
-    const projectPath = gl.projectPathFromUrl(handoff.web_url);
-    if (!projectPath) {
-      throw new Error("the merge request's project path is unknown");
-    }
-    await gl.setChangesRequested(repo, projectPath, handoff.iid, !this.isRequestingChanges());
+    await this.backend.setChangesRequested(!this.isRequestingChanges(), summary);
   }
 
   private isRequestingChanges(): boolean {
@@ -294,7 +285,7 @@ export class ReviewSession implements vscode.Disposable {
   }
 
   private async handleMessage(message: { type: string; [key: string]: unknown }): Promise<void> {
-    const { repo, handoff } = this.options;
+    const { repo } = this.options;
     switch (message.type) {
       case "open": {
         const file = path.join(repo, String(message.path));
@@ -312,7 +303,7 @@ export class ReviewSession implements vscode.Disposable {
       case "startThread": {
         const text = String(message.text ?? "").trim();
         if (text) {
-          await gl.startThread(repo, handoff.iid, text);
+          await this.backend.startThread(text);
           await this.reload();
         }
         return;
@@ -320,13 +311,13 @@ export class ReviewSession implements vscode.Disposable {
       case "reply": {
         const text = String(message.text ?? "").trim();
         if (text) {
-          await gl.replyToThread(repo, handoff.iid, String(message.id), text);
+          await this.backend.replyToThread(String(message.id), text);
           await this.reload();
         }
         return;
       }
       case "resolve":
-        await gl.setThreadResolved(repo, handoff.iid, String(message.id), Boolean(message.resolved));
+        await this.backend.setThreadResolved(String(message.id), Boolean(message.resolved));
         await this.reload();
         return;
     }
@@ -426,7 +417,7 @@ export class ReviewSession implements vscode.Disposable {
   }
 
   private imageSrc(link: string): string | undefined {
-    const upload = gl.uploadFromLink(link, this.projectUrl());
+    const upload = this.backend.uploadFromLink(link);
     if (upload) {
       return this.model.images.get(uploadKey(upload));
     }
@@ -437,19 +428,19 @@ export class ReviewSession implements vscode.Disposable {
   private async loadPictures(): Promise<void> {
     this.imagesLoaded = true;
     const description = this.options.handoff.description ?? "";
-    const uploads = gl.uploadsIn(description).filter(gl.isImage);
+    const uploads = this.backend.imageUploads(description);
     if (uploads.length === 0 || !this.panel) {
       return;
     }
     await fs.mkdir(this.storage.fsPath, { recursive: true });
     await pruneOlderThan(this.storage.fsPath, PICTURE_DAYS);
     for (const upload of uploads) {
-      const file = path.join(this.storage.fsPath, gl.uploadCacheName(upload));
+      const file = path.join(this.storage.fsPath, this.backend.uploadCacheName(upload));
       try {
         await fs.access(file);
       } catch {
         try {
-          const bytes = await gl.fetchUpload(this.options.repo, upload);
+          const bytes = await this.backend.fetchUpload(upload);
           const partial = `${file}.part`;
           await fs.writeFile(partial, bytes);
           await fs.rename(partial, file);
@@ -469,10 +460,6 @@ export class ReviewSession implements vscode.Disposable {
       this.model.errors.push(`Could not read ${what}: ${errorText(error)}`);
       return undefined;
     }
-  }
-
-  private projectUrl(): string | undefined {
-    return this.options.handoff.web_url.split("/-/")[0];
   }
 
   private number(): string {
